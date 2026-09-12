@@ -23,7 +23,7 @@ const CDP_BASE: &str = "http://127.0.0.1:9222";
 #[derive(Clone, Deserialize)]
 struct WorkerConfig {
     controller_url: String,
-    tenant_id: String,
+    user_id: String,
     machine_id: String,
     access_token: String,
 }
@@ -134,13 +134,14 @@ fn load_config(path: &Path) -> Result<WorkerConfig> {
         parsed.scheme() == "https" || parsed.host_str() == Some("localhost"),
         "controller_url must use HTTPS"
     );
+    ensure!(!config.user_id.trim().is_empty(), "user_id is required");
     ensure!(
-        config.tenant_id.len() == 64
+        config.user_id.len() <= 128
             && config
-                .tenant_id
+                .user_id
                 .bytes()
-                .all(|value| value.is_ascii_hexdigit()),
-        "tenant_id must be a SHA-256 hex value"
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'.')),
+        "user_id contains unsupported characters"
     );
     ensure!(
         !config.machine_id.trim().is_empty(),
@@ -331,8 +332,8 @@ async fn request(
 
 fn worker_url(config: &WorkerConfig) -> String {
     format!(
-        "{}/worker/v1/tenants/{}/workers/{}",
-        config.controller_url, config.tenant_id, config.machine_id
+        "{}/worker/v1/users/{}/workers/{}",
+        config.controller_url, config.user_id, config.machine_id
     )
 }
 
@@ -660,7 +661,7 @@ mod tests {
     fn parses_api_config_without_any_local_database() {
         let config: WorkerConfig = toml::from_str(
             r#"controller_url = "https://cybion.ntnl.io"
-tenant_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+user_id = "auth-user"
 machine_id = "machine"
 access_token = "secret""#,
         )
@@ -684,16 +685,13 @@ access_token = "secret""#,
     fn supports_the_cloud_worker_protocol_paths() {
         let config = WorkerConfig {
             controller_url: "https://cybion.ntnl.io".to_owned(),
-            tenant_id: "a".repeat(64),
+            user_id: "auth-user".to_owned(),
             machine_id: "worker".to_owned(),
             access_token: "token".to_owned(),
         };
         assert_eq!(
             worker_url(&config),
-            format!(
-                "https://cybion.ntnl.io/worker/v1/tenants/{}/workers/worker",
-                "a".repeat(64)
-            )
+            "https://cybion.ntnl.io/worker/v1/users/auth-user/workers/worker"
         );
     }
 }

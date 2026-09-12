@@ -9,7 +9,7 @@ Create a pairing from `https://cybion.ntnl.io`, then save the returned config as
 
 ```toml
 controller_url = "https://cybion.ntnl.io"
-tenant_id = "..."
+user_id = "..."
 machine_id = "..."
 access_token = "..."
 ```
