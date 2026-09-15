@@ -14,6 +14,8 @@ use sysinfo::System;
 use tokio::process::Command;
 use tokio_tungstenite::tungstenite::Message;
 
+mod process;
+
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -271,7 +273,14 @@ async fn event_session(client: &Client, config: &WorkerConfig) -> Result<()> {
             let event = buffer[..separator].replace('\r', "");
             buffer.drain(..separator + 2);
             if let Some(call) = parse_sse_call(&event)? {
-                execute_and_submit(client, config, call).await?;
+                let client = client.clone();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    let call_id = call.id.clone();
+                    if let Err(error) = execute_and_submit(&client, &config, call).await {
+                        tracing::warn!(%call_id, %error, "Worker result submission failed");
+                    }
+                });
             }
         }
     }
@@ -303,6 +312,7 @@ async fn execute_and_submit(client: &Client, config: &WorkerConfig, call: ToolCa
         Ok(result) => (false, result),
         Err(error) => (true, json!({"error":error.to_string()})),
     };
+    tracing::info!(call_id = %call.id, thread_id = %call.thread_id, tool = %call.name, failed, "Worker tool call finished");
     let url = format!("{}/calls/{}/result", worker_url(config), call.id);
     request(
         client,
@@ -311,7 +321,9 @@ async fn execute_and_submit(client: &Client, config: &WorkerConfig, call: ToolCa
             .post(url)
             .json(&json!({"result":result,"failed":failed})),
     )
-    .await
+    .await?;
+    tracing::info!(call_id = %call.id, "Worker result submitted");
+    Ok(())
 }
 
 async fn request(
@@ -348,7 +360,7 @@ async fn execute_call(call: &ToolCall) -> Result<Value> {
 
 async fn bash(arguments: &Value) -> Result<Value> {
     let command = required_string(arguments, "command")?;
-    let mut process = if cfg!(windows) {
+    let process = if cfg!(windows) {
         let mut process = Command::new("cmd");
         process.args(["/C", command]);
         process
@@ -357,9 +369,7 @@ async fn bash(arguments: &Value) -> Result<Value> {
         process.args(["-lc", command]);
         process
     };
-    let output = tokio::time::timeout(TOOL_TIMEOUT, process.output())
-        .await
-        .context("Bash command timed out")??;
+    let output = process::output(process, TOOL_TIMEOUT, "Bash command").await?;
     Ok(command_output(
         output.status.code(),
         &output.stdout,
@@ -517,8 +527,8 @@ async fn computer_use(arguments: &Value) -> Result<Value> {
         "move" | "click" => {
             let x = required_number(arguments, "x")?;
             let y = required_number(arguments, "y")?;
-            let mut command = computer_command(action, x, y, None)?;
-            let output = tokio::time::timeout(TOOL_TIMEOUT, command.output()).await??;
+            let command = computer_command(action, x, y, None)?;
+            let output = process::output(command, TOOL_TIMEOUT, "Computer Use command").await?;
             Ok(command_output(
                 output.status.code(),
                 &output.stdout,
@@ -527,8 +537,8 @@ async fn computer_use(arguments: &Value) -> Result<Value> {
         }
         "type" => {
             let text = required_string(arguments, "text")?;
-            let mut command = computer_command("type", 0, 0, Some(text))?;
-            let output = tokio::time::timeout(TOOL_TIMEOUT, command.output()).await??;
+            let command = computer_command("type", 0, 0, Some(text))?;
+            let output = process::output(command, TOOL_TIMEOUT, "Computer Use command").await?;
             Ok(command_output(
                 output.status.code(),
                 &output.stdout,
@@ -652,6 +662,9 @@ fn limited_output(value: &[u8]) -> String {
     let value = &value[..value.len().min(MAX_TOOL_OUTPUT_BYTES)];
     String::from_utf8_lossy(value).to_string()
 }
+
+#[cfg(test)]
+mod dispatch_tests;
 
 #[cfg(test)]
 mod tests {

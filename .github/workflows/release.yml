@@ -44,9 +44,9 @@ jobs:
         if: matrix.cross
         with:
           tool: cross
-      - run: cross build --release --target ${{ matrix.target }}
+      - run: cross build --release --locked --target ${{ matrix.target }}
         if: matrix.cross
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
         if: ${{ !matrix.cross }}
       - shell: bash
         run: |

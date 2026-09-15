@@ -1,6 +1,6 @@
 [package]
 name = "cybion-worker"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 futures-util = "0.3"
+process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,6 +24,11 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+tokio = { version = "1", features = ["net", "sync"] }
 
 [profile.release]
 lto = "thin"
