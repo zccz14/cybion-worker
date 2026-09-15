@@ -573,9 +573,7 @@ fn computer_command(action: &str, x: i64, y: i64, text: Option<&str>) -> Result<
             "move" => format!(
                 "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Cursor]::Position=New-Object System.Drawing.Point({x},{y})"
             ),
-            "click" => format!(
-                "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class Mouse {{ [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int x,int y,int d,int e); }}'; [Mouse]::mouse_event(2,0,0,0,0); [Mouse]::mouse_event(4,0,0,0,0)"
-            ),
+            "click" => "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class Mouse { [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int x,int y,int d,int e); }'; [Mouse]::mouse_event(2,0,0,0,0); [Mouse]::mouse_event(4,0,0,0,0)".to_owned(),
             "type" => format!(
                 "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait({})",
                 serde_json::to_string(text.context("text is required")?)?
