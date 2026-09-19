@@ -405,6 +405,7 @@ async fn event_session_ready(
     let response = client
         .get(format!("{}/events", worker_url(config)))
         .header(delivery::BOOT_HEADER, &delivery.boot_id)
+        .header("x-cybion-worker-version", env!("CARGO_PKG_VERSION"))
         .header(
             header::AUTHORIZATION,
             format!("Bearer {}", config.access_token),
