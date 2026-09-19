@@ -45,8 +45,9 @@ cybion-worker --help
 ```
 
 `run`, `status` and `doctor` accept `--config PATH`. One process owns each config;
-starting a duplicate is rejected. Background startup fails if the process exits
-or cannot connect within 15 seconds, and stops that newly launched process.
+starting a duplicate is rejected. Background startup reports an early process failure. If connection takes longer
+than 15 seconds, the process remains alive and the CLI reports that it is still
+connecting, not that it is ready.
 Logs are in `worker.log` beside the config. `status`'s last connection timestamp
 is historical, not a live health guarantee. The web connection check validates
 the full task round trip. Neither command prints the access token.
@@ -88,3 +89,27 @@ OS permissions and an interactive desktop. Linux without an X11 display is
 reported as not applicable; macOS Accessibility/Automation and Windows desktop
 permissions must be configured explicitly. Diagnostics never click/type on the
 user's current desktop or launch a browser to test it.
+
+## Reliability and remote upgrades (0.2.0)
+
+Each process reports its version and a new in-memory boot ID. Reconnecting keeps
+that boot ID and the call-ID deduplication map. Completed results stay in memory
+and retry upload on transport failures, HTTP 408/429 and 5xx. Acknowledged results
+release their payload; call IDs remain remembered for the process lifetime.
+There is no task database, journal or disk outbox. Restarting Worker may lose
+results; the Controller must not replay old-process commands in the new process.
+
+From 0.2.0 onward, the owning user can request the Controller's recommended
+Worker release from the device page. The Controller pauses new task delivery
+and waits for delivered work; Worker also waits for executing/uploading tasks.
+Worker accepts only a newer numeric release version from the official
+`zccz14/cybion-worker` repository, verifies the SHA-256 manifest and executable
+version, replaces its executable and restarts with the same configuration.
+The old executable is retained as `cybion-worker.previous`; an early replacement
+startup failure restores it. Upgrades require write access to the executable
+directory. Download, checksum or preflight failures retain the current Worker.
+Installation archives and the executable backup are not task persistence.
+
+A 0.1.x Worker has no remote-upgrade handler. Install 0.2.0 manually once;
+subsequent upgrades can be requested through Controller. No arbitrary download
+URL or model-invokable upgrade tool is accepted.

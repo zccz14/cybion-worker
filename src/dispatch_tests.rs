@@ -127,3 +127,126 @@ async fn failed_result_upload_does_not_stop_dispatching_other_calls() {
     ids.sort();
     assert_eq!(ids, ["next", "reject"]);
 }
+
+#[tokio::test]
+async fn reconnect_and_lost_upload_confirmation_do_not_execute_twice() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let app = Router::new()
+        .route(
+            "/worker/v1/users/user/workers/worker/events",
+            get(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    event("once", "echo execution"),
+                )
+            }),
+        )
+        .route(
+            "/worker/v1/users/user/workers/worker/calls/{id}/result",
+            post({
+                let uploads = uploads.clone();
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let uploads = uploads.clone();
+                    let tx = tx.clone();
+                    async move {
+                        let n = uploads.fetch_add(1, Ordering::SeqCst);
+                        tx.send((
+                            headers[delivery::BOOT_HEADER].to_str().unwrap().to_owned(),
+                            body,
+                        ))
+                        .unwrap();
+                        if n == 0 {
+                            (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "0")])
+                        } else {
+                            (StatusCode::OK, [("retry-after", "0")])
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = WorkerConfig {
+        controller_url: format!("http://{}", listener.local_addr().unwrap()),
+        user_id: "user".into(),
+        machine_id: "worker".into(),
+        access_token: "test".into(),
+    };
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let delivery = Arc::new(delivery::DeliveryState::new());
+    let client = Client::new();
+    event_session_ready(&client, &config, None, delivery.clone())
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.0, delivery.boot_id);
+    delivery.wait_idle().await;
+    event_session_ready(&client, &config, None, delivery.clone())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(uploads.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn permanent_upload_rejection_is_not_retried() {
+    let (config, mut received, server) = controller(String::new()).await;
+    let error = delivery::post_until_confirmed(
+        &Client::new(),
+        &config,
+        &format!("{}/missing", config.controller_url),
+        "boot",
+        &json!({}),
+    )
+    .await
+    .unwrap_err();
+    assert!(!delivery::retryable(&error));
+    assert!(received.try_recv().is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn upgrade_event_is_bound_to_the_current_process_and_waits_for_work() {
+    let state = Arc::new(delivery::DeliveryState::new());
+    let call = ToolCall {
+        id: "slow".into(),
+        thread_id: "thread".into(),
+        name: "bash".into(),
+        arguments: json!({"command":"echo slow"}),
+    };
+    assert!(state.admit(&call).unwrap());
+    let waiter = tokio::spawn({
+        let state = state.clone();
+        async move { state.wait_idle().await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!waiter.is_finished());
+    state.finished();
+    waiter.await.unwrap();
+    let event = format!(
+        "event: upgrade\ndata: {}\n\n",
+        json!({"id":"upgrade","version":"v0.2.1","boot_id":state.boot_id})
+    );
+    let parsed = self_update::parse_event(&event).unwrap().unwrap();
+    assert_eq!(parsed.boot_id, state.boot_id);
+    assert_eq!(parsed.version, "v0.2.1");
+}

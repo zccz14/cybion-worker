@@ -1,6 +1,6 @@
 [package]
 name = "cybion-worker"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -11,6 +11,9 @@ name = "cybion-worker"
 path = "src/main.rs"
 
 [dependencies]
+self-replace = "1.5"
+flate2 = "1"
+tar = "0.4"
 fs2 = "0.4"
 sha2 = "0.10"
 hex = "0.4"

@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
@@ -14,11 +15,12 @@ use sysinfo::System;
 use tokio::process::Command;
 use tokio_tungstenite::tungstenite::Message;
 
+mod delivery;
 mod process;
+mod self_update;
 mod setup;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_TOOL_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const CDP_BASE: &str = "http://127.0.0.1:9222";
@@ -70,7 +72,16 @@ async fn main() -> Result<()> {
                 drop(lock);
                 launch_background(config).await
             } else {
-                run(loaded, &config).await
+                let installed = run(loaded, &config).await?;
+                drop(lock);
+                if let Err(error) = launch_background_at(installed.clone(), config.clone()).await {
+                    self_update::rollback(&installed)?;
+                    launch_background_at(installed, config).await?;
+                    return Err(
+                        error.context("Upgrade startup failed; previous executable restored")
+                    );
+                }
+                Ok(())
             }
         }
         WorkerCommand::Status(config) => setup::status(&config).await,
@@ -190,6 +201,10 @@ fn load_config(path: &Path) -> Result<WorkerConfig> {
 
 async fn launch_background(config: PathBuf) -> Result<()> {
     let executable = std::env::current_exe().context("cannot determine the Worker executable")?;
+    launch_background_at(executable, config).await
+}
+
+async fn launch_background_at(executable: PathBuf, config: PathBuf) -> Result<()> {
     let log_path = config
         .parent()
         .context("config path has no parent")?
@@ -235,71 +250,123 @@ async fn launch_background(config: PathBuf) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    child
-        .kill()
-        .context("could not stop Worker after startup timeout")?;
-    child.wait()?;
-    bail!(
-        "Worker did not connect within 15 seconds and was stopped. Inspect {} and run doctor.",
+    println!(
+        "Worker started in the background (PID {}), still connecting. Logs: {}",
+        child.id(),
         log_path.display()
-    )
+    );
+    Ok(())
 }
 
-async fn run(config: WorkerConfig, config_path: &Path) -> Result<()> {
+async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(600))
         .user_agent(format!("cybion-worker/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
-    report_liveness(&client, &config)
-        .await
-        .context("Initial authentication failed; run doctor or re-pair this device")?;
+    let delivery = Arc::new(delivery::DeliveryState::new());
     let reporting_client = client.clone();
     let reporting_config = config.clone();
-    tokio::spawn(async move {
+    let reporting_boot = delivery.boot_id.clone();
+    let reporting = tokio::spawn(async move {
         loop {
-            if let Err(error) = report_liveness(&reporting_client, &reporting_config).await {
+            if let Err(error) =
+                report_liveness_for_boot(&reporting_client, &reporting_config, &reporting_boot)
+                    .await
+            {
                 tracing::warn!(%error, "Worker liveness report failed");
             }
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
         }
     });
-    loop {
-        if let Err(error) = event_session_ready(&client, &config, Some(config_path)).await {
-            if error
-                .downcast_ref::<reqwest::Error>()
-                .and_then(reqwest::Error::status)
-                .is_some_and(|status| {
-                    matches!(
-                        status,
-                        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    let mut failures = 0;
+    let outcome = loop {
+        match event_session_ready(&client, &config, Some(config_path), delivery.clone()).await {
+            Ok(Some(upgrade)) => {
+                delivery.wait_idle().await;
+                let result = async {
+                    self_update::report(
+                        &client,
+                        &config,
+                        &delivery.boot_id,
+                        &upgrade,
+                        "installing",
+                        None,
                     )
-                })
-            {
-                return Err(error.context("Worker credential rejected or revoked. Re-pair this device instead of retrying."));
+                    .await?;
+                    let installed = self_update::install(&client, &upgrade.version).await?;
+                    Ok::<_, anyhow::Error>(installed)
+                }
+                .await;
+                match result {
+                    Ok(installed) => break Ok(installed),
+                    Err(error) => {
+                        tracing::warn!(%error, "Worker upgrade failed; current executable retained");
+                        if let Err(report_error) = self_update::report(
+                            &client,
+                            &config,
+                            &delivery.boot_id,
+                            &upgrade,
+                            "failed",
+                            Some(error.to_string()),
+                        )
+                        .await
+                        {
+                            break Err(report_error);
+                        }
+                    }
+                }
+                failures = 0;
             }
-            tracing::warn!(%error, "Worker event stream ended");
+            Ok(None) => failures = 0,
+            Err(error) => {
+                if !delivery::retryable(&error) {
+                    break Err(error.context(
+                        "Worker connection rejected; inspect configuration or re-pair this device",
+                    ));
+                }
+                tracing::warn!(%error, "Worker event stream ended; reconnecting");
+                failures += 1;
+            }
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
-    }
+        tokio::time::sleep(delivery::retry_delay(failures)).await;
+    };
+    reporting.abort();
+    outcome
 }
 
 async fn report_liveness(client: &Client, config: &WorkerConfig) -> Result<()> {
+    report_liveness_for_boot(client, config, "").await
+}
+
+async fn report_liveness_for_boot(
+    client: &Client,
+    config: &WorkerConfig,
+    boot_id: &str,
+) -> Result<()> {
     let base = worker_url(config);
     let hostname = System::host_name().unwrap_or_else(|| "cybion-worker".to_owned());
     request(
         client,
         config,
-        client.post(format!("{base}/heartbeat")).json(&Heartbeat {
-            hostname,
-            version: env!("CARGO_PKG_VERSION"),
-        }),
+        client
+            .post(format!("{base}/heartbeat"))
+            .header(delivery::BOOT_HEADER, boot_id)
+            .timeout(Duration::from_secs(15))
+            .json(&Heartbeat {
+                hostname,
+                version: env!("CARGO_PKG_VERSION"),
+            }),
     )
     .await?;
     request(
         client,
         config,
-        client.post(format!("{base}/resources")).json(&resources()),
+        client
+            .post(format!("{base}/resources"))
+            .header(delivery::BOOT_HEADER, boot_id)
+            .timeout(Duration::from_secs(15))
+            .json(&resources()),
     )
     .await?;
     Ok(())
@@ -319,16 +386,25 @@ fn resources() -> Value {
 
 #[cfg(test)]
 async fn event_session(client: &Client, config: &WorkerConfig) -> Result<()> {
-    event_session_ready(client, config, None).await
+    event_session_ready(
+        client,
+        config,
+        None,
+        Arc::new(delivery::DeliveryState::new()),
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn event_session_ready(
     client: &Client,
     config: &WorkerConfig,
     ready: Option<&Path>,
-) -> Result<()> {
+    delivery: Arc<delivery::DeliveryState>,
+) -> Result<Option<self_update::Upgrade>> {
     let response = client
         .get(format!("{}/events", worker_url(config)))
+        .header(delivery::BOOT_HEADER, &delivery.boot_id)
         .header(
             header::AUTHORIZATION,
             format!("Bearer {}", config.access_token),
@@ -337,29 +413,47 @@ async fn event_session_ready(
         .await?
         .error_for_status()?;
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer = Vec::new();
     let mut ready = ready;
-    while let Some(chunk) = stream.next().await {
-        buffer.push_str(&String::from_utf8_lossy(&chunk?));
-        while let Some(separator) = buffer.find("\n\n") {
+    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(45), stream.next())
+        .await
+        .context("Worker event stream idle timeout")?
+    {
+        buffer.extend_from_slice(&chunk?);
+        while let Some((separator, width)) = delivery::frame_end(&buffer) {
             if let Some(path) = ready.take() {
                 setup::mark_ready(path)?;
             }
-            let event = buffer[..separator].replace('\r', "");
-            buffer.drain(..separator + 2);
+            let event =
+                String::from_utf8(buffer[..separator].to_vec()).context("invalid event UTF-8")?;
+            buffer.drain(..separator + width);
+            if let Some(upgrade) = self_update::parse_event(&event)? {
+                ensure!(
+                    upgrade.boot_id == delivery.boot_id,
+                    "upgrade addressed to another Worker process"
+                );
+                return Ok(Some(upgrade));
+            }
             if let Some(call) = parse_sse_call(&event)? {
+                if !delivery.admit(&call)? {
+                    continue;
+                }
                 let client = client.clone();
                 let config = config.clone();
+                let delivery = delivery.clone();
                 tokio::spawn(async move {
                     let call_id = call.id.clone();
-                    if let Err(error) = execute_and_submit(&client, &config, call).await {
-                        tracing::warn!(%call_id, %error, "Worker result submission failed");
+                    if let Err(error) =
+                        execute_and_submit(&client, &config, call, &delivery.boot_id).await
+                    {
+                        tracing::warn!(%call_id, %error, "Worker result submission permanently rejected");
                     }
+                    delivery.finished();
                 });
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn parse_sse_call(event: &str) -> Result<Option<ToolCall>> {
@@ -380,7 +474,12 @@ fn parse_sse_call(event: &str) -> Result<Option<ToolCall>> {
     ))
 }
 
-async fn execute_and_submit(client: &Client, config: &WorkerConfig, call: ToolCall) -> Result<()> {
+async fn execute_and_submit(
+    client: &Client,
+    config: &WorkerConfig,
+    call: ToolCall,
+    boot_id: &str,
+) -> Result<()> {
     tracing::info!(call_id = %call.id, thread_id = %call.thread_id, tool = %call.name, "Worker executing tool call");
     let result = execute_call(&call).await;
     let (failed, result) = match result {
@@ -394,12 +493,12 @@ async fn execute_and_submit(client: &Client, config: &WorkerConfig, call: ToolCa
         "calls"
     };
     let url = format!("{}/{category}/{}/result", worker_url(config), call.id);
-    request(
+    delivery::post_until_confirmed(
         client,
         config,
-        client
-            .post(url)
-            .json(&json!({"result":result,"failed":failed})),
+        &url,
+        boot_id,
+        &json!({"result":result,"failed":failed}),
     )
     .await?;
     tracing::info!(call_id = %call.id, "Worker result submitted");
