@@ -1,6 +1,6 @@
 [package]
 name = "cybion-worker"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -11,6 +11,11 @@ name = "cybion-worker"
 path = "src/main.rs"
 
 [dependencies]
+fs2 = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
 anyhow = "1"
 futures-util = "0.3"
 process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
@@ -27,7 +32,6 @@ url = "2"
 
 [dev-dependencies]
 axum = "0.8"
-tempfile = "3"
 tokio = { version = "1", features = ["net", "sync"] }
 
 [profile.release]

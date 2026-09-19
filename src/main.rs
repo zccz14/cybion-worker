@@ -15,6 +15,7 @@ use tokio::process::Command;
 use tokio_tungstenite::tungstenite::Message;
 
 mod process;
+mod setup;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -22,7 +23,7 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_TOOL_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const CDP_BASE: &str = "http://127.0.0.1:9222";
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct WorkerConfig {
     controller_url: String,
     user_id: String,
@@ -62,14 +63,25 @@ async fn main() -> Result<()> {
         .init();
     let command = parse_command()?;
     match command {
-        WorkerCommand::Run {
-            config,
-            background: true,
-        } => launch_background(config),
-        WorkerCommand::Run {
-            config,
-            background: false,
-        } => run(load_config(&config)?).await,
+        WorkerCommand::Run { config, background } => {
+            let lock = setup::lock(&config)?;
+            let loaded = setup::load_or_pair(&config).await?;
+            if background {
+                drop(lock);
+                launch_background(config).await
+            } else {
+                run(loaded, &config).await
+            }
+        }
+        WorkerCommand::Status(config) => setup::status(&config).await,
+        WorkerCommand::Doctor(config) => setup::doctor(&config).await,
+        WorkerCommand::Help => {
+            println!(
+                "Cybion Worker {}\n\ncybion-worker [run] [--background] [--config PATH]\n  First run opens browser authorization; existing configuration is preserved.\ncybion-worker status [--config PATH]\ncybion-worker doctor [--config PATH]\ncybion-worker config-path\n\nBackground mode does not install login/startup persistence.\nTo disconnect, remove this device in Cybion. To re-pair, stop the process and move the config aside first.",
+                env!("CARGO_PKG_VERSION")
+            );
+            Ok(())
+        }
         WorkerCommand::ConfigPath => {
             println!("{}", default_config_path()?.display());
             Ok(())
@@ -80,6 +92,9 @@ async fn main() -> Result<()> {
 enum WorkerCommand {
     Run { config: PathBuf, background: bool },
     ConfigPath,
+    Status(PathBuf),
+    Doctor(PathBuf),
+    Help,
 }
 
 fn parse_command() -> Result<WorkerCommand> {
@@ -87,6 +102,20 @@ fn parse_command() -> Result<WorkerCommand> {
     match arguments.next() {
         None => parse_run_arguments(arguments),
         Some(argument) if argument == "run" => parse_run_arguments(arguments),
+        Some(argument) if argument == "--help" || argument == "help" || argument == "--version" => {
+            Ok(WorkerCommand::Help)
+        }
+        Some(argument) if argument == "status" || argument == "doctor" => {
+            let WorkerCommand::Run { config, background } = parse_run_arguments(arguments)? else {
+                unreachable!()
+            };
+            ensure!(!background, "status/doctor do not accept --background");
+            Ok(if argument == "status" {
+                WorkerCommand::Status(config)
+            } else {
+                WorkerCommand::Doctor(config)
+            })
+        }
         Some(argument) if argument == "config-path" => {
             ensure!(
                 arguments.next().is_none(),
@@ -159,7 +188,7 @@ fn load_config(path: &Path) -> Result<WorkerConfig> {
     })
 }
 
-fn launch_background(config: PathBuf) -> Result<()> {
+async fn launch_background(config: PathBuf) -> Result<()> {
     let executable = std::env::current_exe().context("cannot determine the Worker executable")?;
     let log_path = config
         .parent()
@@ -177,7 +206,7 @@ fn launch_background(config: PathBuf) -> Result<()> {
     command
         .arg("run")
         .arg("--config")
-        .arg(config)
+        .arg(&config)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(error_log));
@@ -186,22 +215,45 @@ fn launch_background(config: PathBuf) -> Result<()> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0000_0008 | 0x0800_0000);
     }
-    command
+    let mut child = command
         .spawn()
         .context("could not start the background Worker")?;
-    println!(
-        "Cybion Worker started in the background; logs: {}",
+    for _ in 0..150 {
+        if let Some(status) = child.try_wait()? {
+            bail!("Worker exited ({status}); inspect {}", log_path.display());
+        }
+        if let Ok(content) = fs::read(setup::ready_path(&config))
+            && let Ok(status) = serde_json::from_slice::<Value>(&content)
+            && status["pid"].as_u64() == Some(u64::from(child.id()))
+        {
+            println!(
+                "Worker connected in the background (PID {}). Logs: {}\nNot configured for automatic startup; use your OS service manager if needed.",
+                child.id(),
+                log_path.display()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    child
+        .kill()
+        .context("could not stop Worker after startup timeout")?;
+    child.wait()?;
+    bail!(
+        "Worker did not connect within 15 seconds and was stopped. Inspect {} and run doctor.",
         log_path.display()
-    );
-    Ok(())
+    )
 }
 
-async fn run(config: WorkerConfig) -> Result<()> {
+async fn run(config: WorkerConfig, config_path: &Path) -> Result<()> {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(600))
         .user_agent(format!("cybion-worker/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
+    report_liveness(&client, &config)
+        .await
+        .context("Initial authentication failed; run doctor or re-pair this device")?;
     let reporting_client = client.clone();
     let reporting_config = config.clone();
     tokio::spawn(async move {
@@ -213,7 +265,19 @@ async fn run(config: WorkerConfig) -> Result<()> {
         }
     });
     loop {
-        if let Err(error) = event_session(&client, &config).await {
+        if let Err(error) = event_session_ready(&client, &config, Some(config_path)).await {
+            if error
+                .downcast_ref::<reqwest::Error>()
+                .and_then(reqwest::Error::status)
+                .is_some_and(|status| {
+                    matches!(
+                        status,
+                        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                    )
+                })
+            {
+                return Err(error.context("Worker credential rejected or revoked. Re-pair this device instead of retrying."));
+            }
             tracing::warn!(%error, "Worker event stream ended");
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
@@ -222,9 +286,7 @@ async fn run(config: WorkerConfig) -> Result<()> {
 
 async fn report_liveness(client: &Client, config: &WorkerConfig) -> Result<()> {
     let base = worker_url(config);
-    let hostname = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "cybion-worker".to_owned());
+    let hostname = System::host_name().unwrap_or_else(|| "cybion-worker".to_owned());
     request(
         client,
         config,
@@ -255,7 +317,16 @@ fn resources() -> Value {
     })
 }
 
+#[cfg(test)]
 async fn event_session(client: &Client, config: &WorkerConfig) -> Result<()> {
+    event_session_ready(client, config, None).await
+}
+
+async fn event_session_ready(
+    client: &Client,
+    config: &WorkerConfig,
+    ready: Option<&Path>,
+) -> Result<()> {
     let response = client
         .get(format!("{}/events", worker_url(config)))
         .header(
@@ -267,9 +338,13 @@ async fn event_session(client: &Client, config: &WorkerConfig) -> Result<()> {
         .error_for_status()?;
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
+    let mut ready = ready;
     while let Some(chunk) = stream.next().await {
         buffer.push_str(&String::from_utf8_lossy(&chunk?));
         while let Some(separator) = buffer.find("\n\n") {
+            if let Some(path) = ready.take() {
+                setup::mark_ready(path)?;
+            }
             let event = buffer[..separator].replace('\r', "");
             buffer.drain(..separator + 2);
             if let Some(call) = parse_sse_call(&event)? {
@@ -313,7 +388,12 @@ async fn execute_and_submit(client: &Client, config: &WorkerConfig, call: ToolCa
         Err(error) => (true, json!({"error":error.to_string()})),
     };
     tracing::info!(call_id = %call.id, thread_id = %call.thread_id, tool = %call.name, failed, "Worker tool call finished");
-    let url = format!("{}/calls/{}/result", worker_url(config), call.id);
+    let category = if call.name == "diagnostics" {
+        "checks"
+    } else {
+        "calls"
+    };
+    let url = format!("{}/{category}/{}/result", worker_url(config), call.id);
     request(
         client,
         config,
@@ -351,6 +431,7 @@ fn worker_url(config: &WorkerConfig) -> String {
 
 async fn execute_call(call: &ToolCall) -> Result<Value> {
     match call.name.as_str() {
+        "diagnostics" => Ok(setup::diagnostics().await),
         "bash" => bash(&call.arguments).await,
         "browser_control" => browser_control(&call.arguments).await,
         "computer_use" => computer_use(&call.arguments).await,

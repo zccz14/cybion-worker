@@ -55,7 +55,13 @@ jobs:
           mkdir -p dist/${{ matrix.artifact }}
           cp target/${{ matrix.target }}/release/$binary dist/${{ matrix.artifact }}/
           cp README.md dist/${{ matrix.artifact }}/
+          # COMPATIBILITY: maintainers retain Windows tar.gz for pre-0.1.4
+          # installers. Remove when their supported minimum moves to 0.1.4.
           tar -C dist -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a -tzip ${{ matrix.artifact }}.zip ./dist/${{ matrix.artifact }}
+            sha256sum ${{ matrix.artifact }}.zip > ${{ matrix.artifact }}.zip.sha256
+          fi
           if command -v shasum >/dev/null 2>&1; then
             shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
           else
@@ -67,6 +73,8 @@ jobs:
           path: |
             *.tar.gz
             *.tar.gz.sha256
+            *.zip
+            *.zip.sha256
   publish:
     needs: build
     runs-on: ubuntu-latest
