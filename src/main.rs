@@ -436,6 +436,7 @@ async fn event_session_ready(
                 return Ok(Some(upgrade));
             }
             if let Some(call) = parse_sse_call(&event)? {
+                spawn_receipt(client, config, &delivery, &call);
                 if !delivery.admit(&call)? {
                     continue;
                 }
@@ -455,6 +456,47 @@ async fn event_session_ready(
         }
     }
     Ok(None)
+}
+
+fn call_category(name: &str) -> &'static str {
+    if name == "diagnostics" {
+        "checks"
+    } else {
+        "calls"
+    }
+}
+
+/// Confirms delivery to the Controller for every received call, duplicates
+/// included, and retries the receipt like a result upload. `begin`/`finished`
+/// keep the post inside the upgrade drain window.
+fn spawn_receipt(
+    client: &Client,
+    config: &WorkerConfig,
+    delivery: &Arc<delivery::DeliveryState>,
+    call: &ToolCall,
+) {
+    let url = format!(
+        "{}/{}/{}/received",
+        worker_url(config),
+        call_category(&call.name),
+        call.id
+    );
+    let call_id = call.id.clone();
+    let client = client.clone();
+    let config = config.clone();
+    let delivery = delivery.clone();
+    delivery.begin();
+    tokio::spawn(async move {
+        match delivery::post_until_confirmed(&client, &config, &url, &delivery.boot_id, &json!({}))
+            .await
+        {
+            Ok(()) => tracing::info!(call_id = %call_id, "Worker receipt submitted"),
+            Err(error) => {
+                tracing::warn!(call_id = %call_id, %error, "Worker receipt submission permanently rejected");
+            }
+        }
+        delivery.finished();
+    });
 }
 
 fn parse_sse_call(event: &str) -> Result<Option<ToolCall>> {
@@ -488,12 +530,12 @@ async fn execute_and_submit(
         Err(error) => (true, json!({"error":error.to_string()})),
     };
     tracing::info!(call_id = %call.id, thread_id = %call.thread_id, tool = %call.name, failed, "Worker tool call finished");
-    let category = if call.name == "diagnostics" {
-        "checks"
-    } else {
-        "calls"
-    };
-    let url = format!("{}/{category}/{}/result", worker_url(config), call.id);
+    let url = format!(
+        "{}/{}/{}/result",
+        worker_url(config),
+        call_category(&call.name),
+        call.id
+    );
     delivery::post_until_confirmed(
         client,
         config,

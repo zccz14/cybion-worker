@@ -25,6 +25,12 @@ impl DeliveryState {
         }
     }
 
+    /// Counts one unit of in-flight work that must settle before the process
+    /// replaces itself for an upgrade: a tool execution or a receipt upload.
+    pub fn begin(&self) {
+        self.active.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn admit(&self, call: &ToolCall) -> Result<bool> {
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(
             &json!({"thread_id":call.thread_id,"name":call.name,"arguments":call.arguments}),
@@ -38,7 +44,7 @@ impl DeliveryState {
             return Ok(false);
         }
         seen.insert(call.id.clone(), fingerprint);
-        self.active.fetch_add(1, Ordering::SeqCst);
+        self.begin();
         Ok(true)
     }
 
@@ -159,5 +165,21 @@ mod tests {
         for n in 0..100 {
             assert!(retry_delay(n) <= Duration::from_secs(30));
         }
+    }
+    #[tokio::test]
+    async fn wait_idle_waits_for_receipt_uploads() {
+        let state = Arc::new(DeliveryState::new());
+        state.begin();
+        let waiting = {
+            let state = state.clone();
+            tokio::spawn(async move { state.wait_idle().await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished());
+        state.finished();
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

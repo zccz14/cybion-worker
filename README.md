@@ -96,6 +96,10 @@ Each process reports its version and a new in-memory boot ID. Reconnecting keeps
 that boot ID and the call-ID deduplication map. Completed results stay in memory
 and retry upload on transport failures, HTTP 408/429 and 5xx. Acknowledged results
 release their payload; call IDs remain remembered for the process lifetime.
+The Worker also posts a delivery receipt for every received call, duplicates
+included, and retries it like a result; the Controller records the receipt and
+stops replaying calls this process already acknowledged. Receipt posts are
+in-flight work, so remote upgrades wait for them before replacing the executable.
 There is no task database, journal or disk outbox. Restarting Worker may lose
 results; the Controller must not replay old-process commands in the new process.
 

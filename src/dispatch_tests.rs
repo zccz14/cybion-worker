@@ -2,7 +2,7 @@ use super::*;
 use axum::{
     Json, Router,
     extract::Path as AxumPath,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
@@ -21,9 +21,11 @@ async fn controller(
 ) -> (
     WorkerConfig,
     mpsc::UnboundedReceiver<(String, Value)>,
+    mpsc::UnboundedReceiver<(String, Value)>,
     JoinHandle<()>,
 ) {
     let (sender, receiver) = mpsc::unbounded_channel();
+    let (receipt_sender, receipt_receiver) = mpsc::unbounded_channel();
     let app = Router::new()
         .route(
             "/worker/v1/users/user/workers/worker/events",
@@ -48,6 +50,26 @@ async fn controller(
                     }
                 },
             ),
+        )
+        .route(
+            "/worker/v1/users/user/workers/worker/calls/{id}/received",
+            post(
+                move |AxumPath(id): AxumPath<String>,
+                      headers: HeaderMap,
+                      Json(receipt): Json<Value>| {
+                    let receipt_sender = receipt_sender.clone();
+                    async move {
+                        assert!(
+                            headers
+                                .get(delivery::BOOT_HEADER)
+                                .is_some_and(|value| !value.is_empty()),
+                            "receipt must carry the boot ID"
+                        );
+                        receipt_sender.send((id, receipt)).unwrap();
+                        StatusCode::OK
+                    }
+                },
+            ),
         );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let config = WorkerConfig {
@@ -59,7 +81,16 @@ async fn controller(
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (config, receiver, server)
+    (config, receiver, receipt_receiver, server)
+}
+
+async fn expect_receipt(receipts: &mut mpsc::UnboundedReceiver<(String, Value)>) -> String {
+    let (id, receipt) = tokio::time::timeout(Duration::from_secs(5), receipts.recv())
+        .await
+        .expect("receipt was not posted")
+        .unwrap();
+    assert_eq!(receipt, json!({}));
+    id
 }
 
 #[tokio::test]
@@ -77,7 +108,7 @@ async fn dispatches_next_call_and_finishes_stream_while_first_call_is_running() 
             gate.display()
         )
     };
-    let (config, mut results, server) =
+    let (config, mut results, mut receipts, server) =
         controller(event("slow", &slow) + &event("fast", "echo fast")).await;
     let client = Client::new();
     let session = tokio::spawn(async move { event_session(&client, &config).await });
@@ -108,11 +139,17 @@ async fn dispatches_next_call_and_finishes_stream_while_first_call_is_running() 
         stream_finished_before_slow,
         "SSE session waited for dispatched work"
     );
+    let mut receipt_ids = [
+        expect_receipt(&mut receipts).await,
+        expect_receipt(&mut receipts).await,
+    ];
+    receipt_ids.sort();
+    assert_eq!(receipt_ids, ["fast", "slow"]);
 }
 
 #[tokio::test]
 async fn failed_result_upload_does_not_stop_dispatching_other_calls() {
-    let (config, mut results, server) =
+    let (config, mut results, mut receipts, server) =
         controller(event("reject", "echo reject") + &event("next", "echo next")).await;
     event_session(&Client::new(), &config).await.unwrap();
     let mut ids = Vec::new();
@@ -123,9 +160,37 @@ async fn failed_result_upload_does_not_stop_dispatching_other_calls() {
             .unwrap();
         ids.push(id);
     }
+    let mut receipt_ids = [
+        expect_receipt(&mut receipts).await,
+        expect_receipt(&mut receipts).await,
+    ];
+    receipt_ids.sort();
     server.abort();
     ids.sort();
     assert_eq!(ids, ["next", "reject"]);
+    assert_eq!(receipt_ids, ["next", "reject"]);
+}
+
+#[tokio::test]
+async fn duplicate_delivery_is_receipted_again_without_re_executing() {
+    let (config, mut results, mut receipts, server) =
+        controller(event("dup", "echo dup") + &event("dup", "echo dup")).await;
+    event_session(&Client::new(), &config).await.unwrap();
+    assert_eq!(expect_receipt(&mut receipts).await, "dup");
+    assert_eq!(expect_receipt(&mut receipts).await, "dup");
+    let (id, result) = tokio::time::timeout(Duration::from_secs(5), results.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, "dup");
+    assert!(result["result"]["stdout"].as_str().unwrap().contains("dup"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), results.recv())
+            .await
+            .is_err(),
+        "duplicate delivery must not execute twice"
+    );
+    server.abort();
 }
 
 #[tokio::test]
@@ -135,6 +200,7 @@ async fn reconnect_and_lost_upload_confirmation_do_not_execute_twice() {
         atomic::{AtomicUsize, Ordering},
     };
     let uploads = Arc::new(AtomicUsize::new(0));
+    let receipts = Arc::new(AtomicUsize::new(0));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let app = Router::new()
         .route(
@@ -165,6 +231,19 @@ async fn reconnect_and_lost_upload_confirmation_do_not_execute_twice() {
                         } else {
                             (StatusCode::OK, [("retry-after", "0")])
                         }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/worker/v1/users/user/workers/worker/calls/{id}/received",
+            post({
+                let receipts = receipts.clone();
+                move || {
+                    let receipts = receipts.clone();
+                    async move {
+                        receipts.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
                     }
                 }
             }),
@@ -203,13 +282,16 @@ async fn reconnect_and_lost_upload_confirmation_do_not_execute_twice() {
             .await
             .is_err()
     );
+    delivery.wait_idle().await;
+    // One receipt per received delivery, one execution for two deliveries.
+    assert_eq!(receipts.load(Ordering::SeqCst), 2);
     assert_eq!(uploads.load(Ordering::SeqCst), 2);
     server.abort();
 }
 
 #[tokio::test]
 async fn permanent_upload_rejection_is_not_retried() {
-    let (config, mut received, server) = controller(String::new()).await;
+    let (config, mut received, _receipts, server) = controller(String::new()).await;
     let error = delivery::post_until_confirmed(
         &Client::new(),
         &config,
