@@ -84,7 +84,10 @@ The device secret used to poll pairing is separate from that credential.
 ## Platforms and capability limits
 
 Releases target macOS arm64/x86_64, Linux x86_64/aarch64 and Windows x86_64.
-Browser Control discovers Chrome, Chromium or Edge. Desktop Control depends on
+Browser Control discovers Chrome, Chromium or Edge. Commands time out after
+30 seconds; a page whose renderer stops answering its DevTools socket is
+closed and replaced with a fresh tab before the timeout is reported, so a
+wedged page cannot stall the Worker. Desktop Control depends on
 OS permissions and an interactive desktop. Linux without an X11 display is
 reported as not applicable; macOS Accessibility/Automation and Windows desktop
 permissions must be configured explicitly. Diagnostics never click/type on the
