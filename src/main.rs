@@ -24,6 +24,9 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_TOOL_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const CDP_BASE: &str = "http://127.0.0.1:9222";
+const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const CDP_RESTART_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct WorkerConfig {
@@ -43,6 +46,7 @@ struct ToolCall {
 
 #[derive(Deserialize)]
 struct DevtoolsTarget {
+    id: String,
     #[serde(rename = "webSocketDebuggerUrl")]
     websocket_url: Option<String>,
     #[serde(rename = "type")]
@@ -611,7 +615,7 @@ async fn browser_control(arguments: &Value) -> Result<Value> {
         "evaluate" => {
             cdp(
                 "Runtime.evaluate",
-                json!({"expression":required_string(arguments, "text")?,"returnByValue":true}),
+                json!({"expression":required_string(arguments, "text")?,"returnByValue":true,"awaitPromise":true}),
             )
             .await
         }
@@ -623,7 +627,7 @@ async fn browser_control(arguments: &Value) -> Result<Value> {
             );
             cdp(
                 "Runtime.evaluate",
-                json!({"expression":expression,"returnByValue":true}),
+                json!({"expression":expression,"returnByValue":true,"awaitPromise":true}),
             )
             .await
         }
@@ -637,7 +641,7 @@ async fn browser_control(arguments: &Value) -> Result<Value> {
             );
             cdp(
                 "Runtime.evaluate",
-                json!({"expression":expression,"returnByValue":true}),
+                json!({"expression":expression,"returnByValue":true,"awaitPromise":true}),
             )
             .await
         }
@@ -647,7 +651,7 @@ async fn browser_control(arguments: &Value) -> Result<Value> {
 }
 
 async fn ensure_browser() -> Result<()> {
-    if devtools_target().await.is_ok() {
+    if devtools_target(CDP_BASE).await.is_ok() {
         return Ok(());
     }
     let executable = chromium_executable().context("could not find Chromium, Chrome, or Edge")?;
@@ -664,7 +668,7 @@ async fn ensure_browser() -> Result<()> {
         .spawn()
         .context("could not launch Chromium")?;
     for _ in 0..20 {
-        if devtools_target().await.is_ok() {
+        if devtools_target(CDP_BASE).await.is_ok() {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -673,11 +677,47 @@ async fn ensure_browser() -> Result<()> {
 }
 
 async fn cdp(method: &str, params: Value) -> Result<Value> {
-    let target = devtools_target().await?;
+    cdp_command(CDP_BASE, method, params, CDP_COMMAND_TIMEOUT).await
+}
+
+async fn cdp_command(base: &str, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+    let mut target_id = None;
+    let outcome = tokio::time::timeout(timeout, async {
+        let target = devtools_target(base).await?;
+        target_id = Some(target.id.clone());
+        browser_command(&target, method, params).await
+    })
+    .await;
+    match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            if let Some(target_id) = target_id {
+                let _ =
+                    tokio::time::timeout(CDP_RESTART_TIMEOUT, restart_page(base, &target_id)).await;
+                bail!(
+                    "Browser Control timed out after {} seconds: the page was unresponsive; it has been closed and a fresh tab opened, retry the request",
+                    timeout.as_secs()
+                );
+            }
+            bail!(
+                "Browser Control timed out after {} seconds waiting for the browser to list targets",
+                timeout.as_secs()
+            );
+        }
+    }
+}
+
+async fn browser_command(target: &DevtoolsTarget, method: &str, params: Value) -> Result<Value> {
     let websocket_url = target
         .websocket_url
+        .as_deref()
         .context("browser target has no DevTools socket")?;
-    let (mut socket, _) = tokio_tungstenite::connect_async(websocket_url).await?;
+    let (mut socket, _) = tokio::time::timeout(
+        CDP_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(websocket_url),
+    )
+    .await
+    .context("Browser Control connect timed out")??;
     socket
         .send(Message::Text(
             json!({"id":1,"method":method,"params":params})
@@ -700,9 +740,87 @@ async fn cdp(method: &str, params: Value) -> Result<Value> {
     bail!("Browser Control connection closed without a response")
 }
 
-async fn devtools_target() -> Result<DevtoolsTarget> {
+async fn restart_page(base: &str, target_id: &str) {
+    if let Err(error) = restart_page_inner(base, target_id).await {
+        tracing::warn!(%error, target_id, "Failed to restart unresponsive browser page");
+    }
+}
+
+async fn restart_page_inner(base: &str, target_id: &str) -> Result<()> {
+    let version: Value = Client::new()
+        .get(format!("{base}/json/version"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let websocket_url = version
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .context("browser has no DevTools socket")?;
+    let (mut socket, _) = tokio::time::timeout(
+        CDP_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(websocket_url),
+    )
+    .await
+    .context("Browser Control connect timed out")??;
+    socket
+        .send(Message::Text(
+            json!({"id":1,"method":"Target.closeTarget","params":{"targetId":target_id}})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    for _ in 0..30 {
+        if !page_target_ids(base)
+            .await?
+            .iter()
+            .any(|id| id.as_str() == target_id)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    ensure!(
+        !page_target_ids(base)
+            .await?
+            .iter()
+            .any(|id| id.as_str() == target_id),
+        "unresponsive page {target_id} did not close"
+    );
+    if devtools_target(base).await.is_ok() {
+        return Ok(());
+    }
+    socket
+        .send(Message::Text(
+            json!({"id":2,"method":"Target.createTarget","params":{"url":"about:blank"}})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    for _ in 0..30 {
+        if devtools_target(base).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("browser has no page target after restart")
+}
+
+async fn page_target_ids(base: &str) -> Result<Vec<String>> {
     let targets = Client::new()
-        .get(format!("{CDP_BASE}/json/list"))
+        .get(format!("{base}/json/list"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<DevtoolsTarget>>()
+        .await?;
+    Ok(targets.into_iter().map(|target| target.id).collect())
+}
+
+async fn devtools_target(base: &str) -> Result<DevtoolsTarget> {
+    let targets = Client::new()
+        .get(format!("{base}/json/list"))
         .send()
         .await?
         .error_for_status()?
@@ -884,6 +1002,8 @@ fn limited_output(value: &[u8]) -> String {
     String::from_utf8_lossy(value).to_string()
 }
 
+#[cfg(test)]
+mod browser_tests;
 #[cfg(test)]
 mod dispatch_tests;
 
