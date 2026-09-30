@@ -886,6 +886,18 @@ async fn computer_use(arguments: &Value) -> Result<Value> {
                 &output.stderr,
             ))
         }
+        "screenshot" => {
+            let command = screenshot_command();
+            let output = process::output(command, TOOL_TIMEOUT, "Computer Use command").await?;
+            ensure!(
+                output.status.success(),
+                "screenshot failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            let data =
+                String::from_utf8(output.stdout).context("screenshot output is not UTF-8")?;
+            Ok(json!({"data": data.trim()}))
+        }
         unknown => bail!("unsupported computer action: {unknown}"),
     }
 }
@@ -914,7 +926,9 @@ fn computer_command(action: &str, x: i64, y: i64, text: Option<&str>) -> Result<
             "move" => format!(
                 "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Cursor]::Position=New-Object System.Drawing.Point({x},{y})"
             ),
-            "click" => "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class Mouse { [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int x,int y,int d,int e); }'; [Mouse]::mouse_event(2,0,0,0,0); [Mouse]::mouse_event(4,0,0,0,0)".to_owned(),
+            "click" => format!(
+                "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class Mouse {{ [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int x,int y,int d,int e); [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int x,int y); }}'; [Mouse]::SetCursorPos({x},{y}); [Mouse]::mouse_event(2,0,0,0,0); [Mouse]::mouse_event(4,0,0,0,0)"
+            ),
             "type" => format!(
                 "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait({})",
                 serde_json::to_string(text.context("text is required")?)?
@@ -954,6 +968,37 @@ fn computer_command(action: &str, x: i64, y: i64, text: Option<&str>) -> Result<
             _ => bail!("unsupported computer action"),
         }
         Ok(command)
+    }
+}
+
+fn screenshot_command() -> Command {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "f=$(mktemp \"${TMPDIR:-/tmp}/cybion-shot.XXXXXX\"); /usr/sbin/screencapture -x -t png \"$f\" && /usr/bin/base64 -i \"$f\"; rc=$?; rm -f \"$f\"; exit $rc",
+        ]);
+        command
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $bounds=[System.Windows.Forms.SystemInformation]::VirtualScreen; $bitmap=[System.Drawing.Bitmap]::new($bounds.Width,$bounds.Height); $graphics=[System.Drawing.Graphics]::FromImage($bitmap); $graphics.CopyFromScreen($bounds.X,$bounds.Y,0,0,$bitmap.Size); $stream=[System.IO.MemoryStream]::new(); $bitmap.Save($stream,[System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($stream.ToArray())",
+        ]);
+        command
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "f=$(mktemp \"${TMPDIR:-/tmp}/cybion-shot.XXXXXX\"); import -window root -silent \"png:$f\" && base64 -w0 \"$f\"; rc=$?; rm -f \"$f\"; exit $rc",
+        ]);
+        command
     }
 }
 

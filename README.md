@@ -90,7 +90,8 @@ closed and replaced with a fresh tab before the timeout is reported, so a
 wedged page cannot stall the Worker. Desktop Control depends on
 OS permissions and an interactive desktop. Linux without an X11 display is
 reported as not applicable; macOS Accessibility/Automation and Windows desktop
-permissions must be configured explicitly. Diagnostics never click/type on the
+permissions must be configured explicitly; macOS Screen Recording permission is
+additionally required for screenshots. Diagnostics never click/type on the
 user's current desktop or launch a browser to test it.
 
 ## Reliability and remote upgrades (0.2.0)
