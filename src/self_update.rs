@@ -78,6 +78,47 @@ async fn download(client: &Client, url: &str, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Download candidates in preference order. The Controller mirrors the official
+/// GitHub release assets at `/worker-release/{tag}/{asset}` so devices on
+/// networks that cannot reach GitHub can still upgrade; the official GitHub
+/// release stays as the fallback source.
+fn asset_sources(controller_url: &str, tag: &str, asset: &str) -> Result<Vec<String>> {
+    let mut mirrored = url::Url::parse(controller_url).context("controller_url must be a URL")?;
+    mirrored
+        .path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("controller_url must support path segments"))?
+        .pop_if_empty()
+        .extend(["worker-release", tag, asset]);
+    Ok(vec![
+        mirrored.to_string(),
+        format!("{RELEASES}/{tag}/{asset}"),
+    ])
+}
+
+async fn fetch_from_sources(
+    client: &Client,
+    sources: &[String],
+    asset: &str,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut failures = Vec::new();
+    for source in sources {
+        let fetched = async {
+            let archive = download(client, source, MAX_ARCHIVE).await?;
+            let checksum = download(client, &format!("{source}.sha256"), 1024).await?;
+            Ok::<_, anyhow::Error>((archive, checksum))
+        }
+        .await;
+        match fetched {
+            Ok(fetched) => {
+                tracing::info!(source = %source, "release asset downloaded");
+                return Ok(fetched);
+            }
+            Err(error) => failures.push(format!("{source}: {error}")),
+        }
+    }
+    bail!("could not download {asset}: {}", failures.join("; "))
+}
+
 fn verify(archive: &[u8], checksum: &[u8], name: &str) -> Result<()> {
     let text = std::str::from_utf8(checksum)?;
     let fields: Vec<_> = text.split_whitespace().collect();
@@ -113,7 +154,7 @@ fn extract(archive: &[u8], expected: &str, target: &mut fs::File) -> Result<()> 
     Ok(())
 }
 
-pub async fn install(client: &Client, requested: &str) -> Result<PathBuf> {
+pub async fn install(client: &Client, controller_url: &str, requested: &str) -> Result<PathBuf> {
     let target_version = version(requested)?;
     ensure!(
         target_version > version(env!("CARGO_PKG_VERSION"))?,
@@ -125,9 +166,8 @@ pub async fn install(client: &Client, requested: &str) -> Result<PathBuf> {
     );
     let folder = platform(std::env::consts::OS, std::env::consts::ARCH)?;
     let asset = format!("{folder}.tar.gz");
-    let url = format!("{RELEASES}/{tag}/{asset}");
-    let archive = download(client, &url, MAX_ARCHIVE).await?;
-    let checksum = download(client, &format!("{url}.sha256"), 1024).await?;
+    let sources = asset_sources(controller_url, &tag, &asset)?;
+    let (archive, checksum) = fetch_from_sources(client, &sources, &asset).await?;
     verify(&archive, &checksum, &asset)?;
     let installed = std::env::current_exe()?;
     let parent = installed.parent().context("executable has no parent")?;
@@ -226,6 +266,73 @@ mod tests {
         verify(b"fixture", text.as_bytes(), "asset.tar.gz").unwrap();
         assert!(verify(b"tampered", text.as_bytes(), "asset.tar.gz").is_err());
         assert!(verify(b"fixture", text.as_bytes(), "other.tar.gz").is_err());
+    }
+    #[test]
+    fn controller_mirror_is_preferred_and_github_remains_the_fallback() {
+        let sources = asset_sources(
+            "https://cybion.ntnl.io/",
+            "v0.2.4",
+            "cybion-worker-linux-x86_64.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(
+            sources[0],
+            "https://cybion.ntnl.io/worker-release/v0.2.4/cybion-worker-linux-x86_64.tar.gz"
+        );
+        assert_eq!(
+            sources[1],
+            "https://github.com/zccz14/cybion-worker/releases/download/v0.2.4/cybion-worker-linux-x86_64.tar.gz"
+        );
+        assert!(asset_sources("not-a-url", "v0.2.4", "asset").is_err());
+    }
+    #[tokio::test]
+    async fn downloads_fall_back_and_report_every_failed_source() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+            if uri.path().ends_with(".tar.gz.sha256") {
+                (
+                    axum::http::StatusCode::OK,
+                    format!(
+                        "{}  asset.tar.gz\n",
+                        hex::encode(Sha256::digest(b"fixture"))
+                    ),
+                )
+            } else if uri.path() == "/mirror/asset.tar.gz" {
+                (axum::http::StatusCode::OK, "fixture".to_owned())
+            } else {
+                (axum::http::StatusCode::NOT_FOUND, String::new())
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new();
+        let sources = vec![
+            format!("{base}/mirror/asset.tar.gz"),
+            format!("{base}/missing/asset.tar.gz"),
+        ];
+        let (archive, checksum) = fetch_from_sources(&client, &sources, "asset.tar.gz")
+            .await
+            .unwrap();
+        assert_eq!(archive, b"fixture");
+        assert!(
+            String::from_utf8(checksum)
+                .unwrap()
+                .contains("  asset.tar.gz")
+        );
+        server.abort();
+        let failed = fetch_from_sources(
+            &client,
+            &[
+                "http://127.0.0.1:1/asset.tar.gz".to_owned(),
+                "http://127.0.0.1:1/backup/asset.tar.gz".to_owned(),
+            ],
+            "asset.tar.gz",
+        )
+        .await
+        .expect_err("both sources must fail");
+        let message = failed.to_string();
+        assert!(message.contains("http://127.0.0.1:1/asset.tar.gz"));
+        assert!(message.contains("http://127.0.0.1:1/backup/asset.tar.gz"));
     }
     #[test]
     fn extraction_only_writes_the_exact_regular_executable() {

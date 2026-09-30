@@ -298,7 +298,9 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
                         None,
                     )
                     .await?;
-                    let installed = self_update::install(&client, &upgrade.version).await?;
+                    let installed =
+                        self_update::install(&client, &config.controller_url, &upgrade.version)
+                            .await?;
                     Ok::<_, anyhow::Error>(installed)
                 }
                 .await;

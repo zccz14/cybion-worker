@@ -110,9 +110,11 @@ results; the Controller must not replay old-process commands in the new process.
 From 0.2.0 onward, the owning user can request the Controller's recommended
 Worker release from the device page. The Controller pauses new task delivery
 and waits for delivered work; Worker also waits for executing/uploading tasks.
-Worker accepts only a newer numeric release version from the official
-`zccz14/cybion-worker` repository, verifies the SHA-256 manifest and executable
-version, replaces its executable and restarts with the same configuration.
+Worker accepts only a newer numeric release version of the official
+`zccz14/cybion-worker` release, downloads it through the Controller's mirrored
+copy of the release assets (falling back to GitHub directly), verifies the
+SHA-256 manifest and executable version, replaces its executable and restarts
+with the same configuration.
 The old executable is retained as `cybion-worker.previous`; an early replacement
 startup failure restores it. Upgrades require write access to the executable
 directory. Download, checksum or preflight failures retain the current Worker.
