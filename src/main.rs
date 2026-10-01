@@ -1125,7 +1125,7 @@ access_token = "secret""#,
     #[tokio::test]
     async fn bash_timeout_kills_a_command_that_exceeds_it() {
         let command = if cfg!(windows) {
-            "powershell -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 10\""
+            "ping -n 11 127.0.0.1"
         } else {
             "sleep 10"
         };
