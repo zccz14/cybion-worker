@@ -589,6 +589,7 @@ async fn execute_call(call: &ToolCall) -> Result<Value> {
 
 async fn bash(arguments: &Value) -> Result<Value> {
     let command = required_string(arguments, "command")?;
+    let timeout = bash_timeout(arguments)?;
     let process = if cfg!(windows) {
         let mut process = Command::new("cmd");
         process.args(["/C", command]);
@@ -598,12 +599,25 @@ async fn bash(arguments: &Value) -> Result<Value> {
         process.args(["-lc", command]);
         process
     };
-    let output = process::output(process, TOOL_TIMEOUT, "Bash command").await?;
+    let output = process::output(process, timeout, "Bash command").await?;
     Ok(command_output(
         output.status.code(),
         &output.stdout,
         &output.stderr,
     ))
+}
+
+// The command timeout runs from execution start; the controller dispatches the
+// call only after any delay_seconds wait, so that wait never counts.
+fn bash_timeout(arguments: &Value) -> Result<Duration> {
+    let Some(value) = arguments.get("timeout_seconds") else {
+        return Ok(TOOL_TIMEOUT);
+    };
+    let seconds = value
+        .as_u64()
+        .filter(|seconds| *seconds >= 1)
+        .context("timeout_seconds must be a positive number of seconds")?;
+    Ok(Duration::from_secs(seconds))
 }
 
 async fn browser_control(arguments: &Value) -> Result<Value> {
@@ -1094,5 +1108,43 @@ access_token = "secret""#,
             worker_url(&config),
             "https://cybion.ntnl.io/worker/v1/users/auth-user/workers/worker"
         );
+    }
+
+    #[test]
+    fn bash_timeout_seconds_default_and_validation() {
+        assert_eq!(bash_timeout(&json!({})).unwrap(), TOOL_TIMEOUT);
+        assert_eq!(
+            bash_timeout(&json!({"timeout_seconds": 3600})).unwrap(),
+            Duration::from_secs(3600)
+        );
+        for invalid in [json!(0), json!(-1), json!(1.5), json!("600")] {
+            assert!(bash_timeout(&json!({"timeout_seconds": invalid})).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_kills_a_command_that_exceeds_it() {
+        let command = if cfg!(windows) {
+            "powershell -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 10\""
+        } else {
+            "sleep 10"
+        };
+        let started = std::time::Instant::now();
+        let error = bash(&json!({"command": command, "timeout_seconds": 1}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the timeout must kill the command before it finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_accepts_timeout_seconds_without_a_ceiling() {
+        let result = bash(&json!({"command": "echo done", "timeout_seconds": u64::MAX}))
+            .await
+            .unwrap();
+        assert!(result["stdout"].as_str().unwrap().contains("done"));
     }
 }
