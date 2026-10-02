@@ -268,6 +268,11 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
         .timeout(Duration::from_secs(600))
         .user_agent(format!("cybion-worker/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
+    // The event stream outlives the 600s total timeout; its per-chunk idle timeout owns liveness.
+    let stream_client = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent(format!("cybion-worker/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
     let delivery = Arc::new(delivery::DeliveryState::new());
     let reporting_client = client.clone();
     let reporting_config = config.clone();
@@ -285,7 +290,9 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
     });
     let mut failures = 0;
     let outcome = loop {
-        match event_session_ready(&client, &config, Some(config_path), delivery.clone()).await {
+        match event_session_ready(&stream_client, &config, Some(config_path), delivery.clone())
+            .await
+        {
             Ok(Some(upgrade)) => {
                 delivery.wait_idle().await;
                 let result = async {
