@@ -2,8 +2,11 @@
 
 A single, SQLite-free execution binary for hosted Cybion. It receives Bash,
 Browser Control and Computer Use calls over an outbound SSE connection and
-returns results over HTTPS. Run it as the OS account whose files and desktop
-you intend Cybion to access; it is not a sandbox or per-command approval system.
+returns results over HTTPS. The Controller may cancel a delivered call at any
+time: a queued execution never starts, a running Bash or Computer Use process
+tree is terminated, and the call answers with a cancelled result. Run it as the
+OS account whose files and desktop you intend Cybion to access; it is not a
+sandbox or per-command approval system.
 
 ## Connect a device
 
