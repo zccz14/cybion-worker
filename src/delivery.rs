@@ -7,12 +7,14 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+use tokio::sync::watch;
 
 pub const BOOT_HEADER: &str = "x-cybion-worker-boot-id";
 
 pub struct DeliveryState {
     pub boot_id: String,
     seen: Mutex<HashMap<String, String>>,
+    cancels: Mutex<HashMap<String, watch::Sender<bool>>>,
     active: AtomicUsize,
 }
 
@@ -21,6 +23,7 @@ impl DeliveryState {
         Self {
             boot_id: uuid::Uuid::new_v4().to_string(),
             seen: Mutex::new(HashMap::new()),
+            cancels: Mutex::new(HashMap::new()),
             active: AtomicUsize::new(0),
         }
     }
@@ -46,6 +49,37 @@ impl DeliveryState {
         seen.insert(call.id.clone(), fingerprint);
         self.begin();
         Ok(true)
+    }
+
+    /// Registers the abort handle for an admitted call before its execution
+    /// task spawns, so a cancel event can never race past it.
+    pub fn watch_cancel(&self, call_id: &str) -> watch::Receiver<bool> {
+        let (sender, receiver) = watch::channel(false);
+        self.cancels
+            .lock()
+            .expect("delivery lock poisoned")
+            .insert(call_id.to_owned(), sender);
+        receiver
+    }
+
+    /// Aborts the tracked execution for `call_id` if it is still in flight.
+    /// Cancels for calls that already settled are ignored.
+    pub fn cancel(&self, call_id: &str) {
+        if let Some(sender) = self
+            .cancels
+            .lock()
+            .expect("delivery lock poisoned")
+            .get(call_id)
+        {
+            let _ = sender.send(true);
+        }
+    }
+
+    pub fn release(&self, call_id: &str) {
+        self.cancels
+            .lock()
+            .expect("delivery lock poisoned")
+            .remove(call_id);
     }
 
     pub fn finished(&self) {
@@ -158,6 +192,19 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn cancel_reaches_in_flight_calls_only() {
+        let state = DeliveryState::new();
+        let settled = state.watch_cancel("settled");
+        state.release("settled");
+        state.cancel("settled");
+        assert!(!*settled.borrow());
+        let running = state.watch_cancel("running");
+        state.cancel("running");
+        assert!(*running.borrow());
+        state.release("running");
+    }
+
     #[test]
     fn frame_boundaries_and_backoff_are_bounded() {
         assert_eq!(frame_end(b"data: a\r\n\r\nrest"), Some((7, 4)));

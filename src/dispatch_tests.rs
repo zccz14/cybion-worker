@@ -16,6 +16,10 @@ fn event(id: &str, command: &str) -> String {
     )
 }
 
+fn cancel_event(id: &str) -> String {
+    format!("event: cancel\ndata: {}\n\n", json!({ "id": id }))
+}
+
 async fn controller(
     events: String,
 ) -> (
@@ -331,4 +335,35 @@ async fn upgrade_event_is_bound_to_the_current_process_and_waits_for_work() {
     let parsed = self_update::parse_event(&event).unwrap().unwrap();
     assert_eq!(parsed.boot_id, state.boot_id);
     assert_eq!(parsed.version, "v0.2.1");
+}
+
+#[tokio::test]
+async fn cancel_event_aborts_a_running_call_before_its_timeout() {
+    let slow = if cfg!(windows) {
+        "ping -n 30 127.0.0.1".to_owned()
+    } else {
+        "sleep 30".to_owned()
+    };
+    let (config, mut results, mut receipts, server) =
+        controller(event("slow", &slow) + &cancel_event("slow")).await;
+    let client = Client::new();
+    let started = std::time::Instant::now();
+    let session = tokio::spawn(async move { event_session(&client, &config).await });
+    assert_eq!(expect_receipt(&mut receipts).await, "slow");
+    let (id, result) = tokio::time::timeout(Duration::from_secs(5), results.recv())
+        .await
+        .expect("cancelled call did not finish")
+        .unwrap();
+    assert_eq!(id, "slow");
+    assert!(result["failed"].as_bool().unwrap());
+    assert!(
+        result["result"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"),
+        "{result}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    session.await.unwrap().unwrap();
+    server.abort();
 }

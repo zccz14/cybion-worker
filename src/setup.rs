@@ -218,9 +218,10 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 pub async fn diagnostics() -> Value {
+    let (_cancel, mut cancel) = tokio::sync::watch::channel(false);
     let shell = match tokio::time::timeout(
         Duration::from_secs(5),
-        bash(&json!({"command":"echo cybion-worker-check"})),
+        bash(&json!({"command":"echo cybion-worker-check"}), &mut cancel),
     )
     .await
     {

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sysinfo::System;
 use tokio::process::Command;
+use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 
 mod delivery;
@@ -453,18 +454,22 @@ async fn event_session_ready(
                 if !delivery.admit(&call)? {
                     continue;
                 }
+                let cancel = delivery.watch_cancel(&call.id);
                 let client = client.clone();
                 let config = config.clone();
                 let delivery = delivery.clone();
                 tokio::spawn(async move {
                     let call_id = call.id.clone();
                     if let Err(error) =
-                        execute_and_submit(&client, &config, call, &delivery.boot_id).await
+                        execute_and_submit(&client, &config, call, cancel, &delivery.boot_id).await
                     {
                         tracing::warn!(%call_id, %error, "Worker result submission permanently rejected");
                     }
+                    delivery.release(&call_id);
                     delivery.finished();
                 });
+            } else if let Some(cancelled) = parse_sse_cancel(&event)? {
+                delivery.cancel(&cancelled);
             }
         }
     }
@@ -512,7 +517,7 @@ fn spawn_receipt(
     });
 }
 
-fn parse_sse_call(event: &str) -> Result<Option<ToolCall>> {
+fn sse_event(event: &str) -> (&str, String) {
     let mut event_name = "message";
     let mut data = String::new();
     for line in event.lines() {
@@ -522,6 +527,11 @@ fn parse_sse_call(event: &str) -> Result<Option<ToolCall>> {
             data.push_str(value.trim_start());
         }
     }
+    (event_name, data)
+}
+
+fn parse_sse_call(event: &str) -> Result<Option<ToolCall>> {
+    let (event_name, data) = sse_event(event);
     if event_name != "tool_call" {
         return Ok(None);
     }
@@ -530,14 +540,33 @@ fn parse_sse_call(event: &str) -> Result<Option<ToolCall>> {
     ))
 }
 
+fn parse_sse_cancel(event: &str) -> Result<Option<String>> {
+    let (event_name, data) = sse_event(event);
+    if event_name != "cancel" {
+        return Ok(None);
+    }
+    let payload: Value = serde_json::from_str(&data).context("Worker received malformed cancel")?;
+    Ok(Some(
+        payload["id"]
+            .as_str()
+            .context("cancel event without a call id")?
+            .to_owned(),
+    ))
+}
+
 async fn execute_and_submit(
     client: &Client,
     config: &WorkerConfig,
     call: ToolCall,
+    mut cancel: watch::Receiver<bool>,
     boot_id: &str,
 ) -> Result<()> {
     tracing::info!(call_id = %call.id, thread_id = %call.thread_id, tool = %call.name, "Worker executing tool call");
-    let result = execute_call(&call).await;
+    let result = if *cancel.borrow() {
+        Err(anyhow::anyhow!("Call cancelled by the Controller"))
+    } else {
+        execute_call(&call, &mut cancel).await
+    };
     let (failed, result) = match result {
         Ok(result) => (false, result),
         Err(error) => (true, json!({"error":error.to_string()})),
@@ -584,17 +613,17 @@ fn worker_url(config: &WorkerConfig) -> String {
     )
 }
 
-async fn execute_call(call: &ToolCall) -> Result<Value> {
+async fn execute_call(call: &ToolCall, cancel: &mut watch::Receiver<bool>) -> Result<Value> {
     match call.name.as_str() {
         "diagnostics" => Ok(setup::diagnostics().await),
-        "bash" => bash(&call.arguments).await,
+        "bash" => bash(&call.arguments, cancel).await,
         "browser_control" => browser_control(&call.arguments).await,
-        "computer_use" => computer_use(&call.arguments).await,
+        "computer_use" => computer_use(&call.arguments, cancel).await,
         unknown => bail!("unsupported Worker tool: {unknown}"),
     }
 }
 
-async fn bash(arguments: &Value) -> Result<Value> {
+async fn bash(arguments: &Value, cancel: &mut watch::Receiver<bool>) -> Result<Value> {
     let command = required_string(arguments, "command")?;
     let timeout = bash_timeout(arguments)?;
     let process = if cfg!(windows) {
@@ -606,7 +635,7 @@ async fn bash(arguments: &Value) -> Result<Value> {
         process.args(["-lc", command]);
         process
     };
-    let output = process::output(process, timeout, "Bash command").await?;
+    let output = process::output(process, timeout, "Bash command", cancel).await?;
     Ok(command_output(
         output.status.code(),
         &output.stdout,
@@ -885,14 +914,15 @@ fn chromium_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-async fn computer_use(arguments: &Value) -> Result<Value> {
+async fn computer_use(arguments: &Value, cancel: &mut watch::Receiver<bool>) -> Result<Value> {
     let action = required_string(arguments, "action")?;
     match action {
         "move" | "click" => {
             let x = required_number(arguments, "x")?;
             let y = required_number(arguments, "y")?;
             let command = computer_command(action, x, y, None)?;
-            let output = process::output(command, TOOL_TIMEOUT, "Computer Use command").await?;
+            let output =
+                process::output(command, TOOL_TIMEOUT, "Computer Use command", cancel).await?;
             Ok(command_output(
                 output.status.code(),
                 &output.stdout,
@@ -902,7 +932,8 @@ async fn computer_use(arguments: &Value) -> Result<Value> {
         "type" => {
             let text = required_string(arguments, "text")?;
             let command = computer_command("type", 0, 0, Some(text))?;
-            let output = process::output(command, TOOL_TIMEOUT, "Computer Use command").await?;
+            let output =
+                process::output(command, TOOL_TIMEOUT, "Computer Use command", cancel).await?;
             Ok(command_output(
                 output.status.code(),
                 &output.stdout,
@@ -911,7 +942,8 @@ async fn computer_use(arguments: &Value) -> Result<Value> {
         }
         "screenshot" => {
             let command = screenshot_command();
-            let output = process::output(command, TOOL_TIMEOUT, "Computer Use command").await?;
+            let output =
+                process::output(command, TOOL_TIMEOUT, "Computer Use command", cancel).await?;
             ensure!(
                 output.status.success(),
                 "screenshot failed: {}",
@@ -1093,7 +1125,7 @@ access_token = "secret""#,
     }
 
     #[test]
-    fn parses_tool_call_sse_events_only() {
+    fn parses_tool_call_and_cancel_sse_events() {
         assert!(
             parse_sse_call("event: heartbeat\ndata: {}\n")
                 .unwrap()
@@ -1101,6 +1133,21 @@ access_token = "secret""#,
         );
         let call = parse_sse_call("event: tool_call\ndata: {\"id\":\"call\",\"thread_id\":\"thread\",\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}\n").unwrap().unwrap();
         assert_eq!(call.name, "bash");
+        assert_eq!(
+            parse_sse_cancel("event: cancel\ndata: {\"id\":\"call-1\"}\n").unwrap(),
+            Some("call-1".to_owned())
+        );
+        assert!(
+            parse_sse_cancel("event: tool_call\ndata: {}\n")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            self_update::parse_event("event: cancel\ndata: {\"id\":\"call-1\"}\n")
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_sse_cancel("event: cancel\ndata: {}\n").is_err());
     }
 
     #[test]
@@ -1129,17 +1176,24 @@ access_token = "secret""#,
         }
     }
 
+    fn long_running_command() -> &'static str {
+        if cfg!(windows) {
+            "ping -n 30 127.0.0.1"
+        } else {
+            "sleep 30"
+        }
+    }
+
     #[tokio::test]
     async fn bash_timeout_kills_a_command_that_exceeds_it() {
-        let command = if cfg!(windows) {
-            "ping -n 11 127.0.0.1"
-        } else {
-            "sleep 10"
-        };
+        let (_cancel, mut receiver) = watch::channel(false);
         let started = std::time::Instant::now();
-        let error = bash(&json!({"command": command, "timeout_seconds": 1}))
-            .await
-            .unwrap_err();
+        let error = bash(
+            &json!({"command": long_running_command(), "timeout_seconds": 1}),
+            &mut receiver,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(
             started.elapsed() < Duration::from_secs(8),
@@ -1148,10 +1202,38 @@ access_token = "secret""#,
     }
 
     #[tokio::test]
-    async fn bash_accepts_timeout_seconds_without_a_ceiling() {
-        let result = bash(&json!({"command": "echo done", "timeout_seconds": u64::MAX}))
+    async fn bash_stops_when_the_controller_cancels_it() {
+        let (sender, mut receiver) = watch::channel(false);
+        let started = std::time::Instant::now();
+        let running = tokio::spawn(async move {
+            bash(
+                &json!({"command": long_running_command(), "timeout_seconds": 600}),
+                &mut receiver,
+            )
             .await
-            .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sender.send(true).unwrap();
+        let error = running.await.unwrap().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Bash command cancelled by the Controller"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the cancel must kill the command before it finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_accepts_timeout_seconds_without_a_ceiling() {
+        let (_cancel, mut receiver) = watch::channel(false);
+        let result = bash(
+            &json!({"command": "echo done", "timeout_seconds": u64::MAX}),
+            &mut receiver,
+        )
+        .await
+        .unwrap();
         assert!(result["stdout"].as_str().unwrap().contains("done"));
     }
 }
