@@ -1,8 +1,7 @@
 # Cybion Worker
 
-A single, SQLite-free execution binary for hosted Cybion. It receives Bash,
-Browser Control and Computer Use calls over an outbound SSE connection and
-returns results over HTTPS. The Controller may cancel a delivered call at any
+A single, SQLite-free execution binary for hosted Cybion. It receives Bash, Browser Control, Computer Use and View Image calls over an
+outbound SSE connection and returns results over HTTPS. The Controller may cancel a delivered call at any
 time: a queued execution never starts, a running Bash or Computer Use process
 tree is terminated, and the call answers with a cancelled result. Run it as the
 OS account whose files and desktop you intend Cybion to access; it is not a
@@ -94,8 +93,10 @@ wedged page cannot stall the Worker. Desktop Control depends on
 OS permissions and an interactive desktop. Linux without an X11 display is
 reported as not applicable; macOS Accessibility/Automation and Windows desktop
 permissions must be configured explicitly; macOS Screen Recording permission is
-additionally required for screenshots. Diagnostics never click/type on the
-user's current desktop or launch a browser to test it.
+additionally required for screenshots. View Image reads PNG, JPEG, WebP, or
+GIF files up to 4 MiB into the conversation; larger files report an error and
+should be resized first. Diagnostics never click/type on the user's current
+desktop or launch a browser to test it.
 
 ## Reliability and remote upgrades (0.2.0)
 
