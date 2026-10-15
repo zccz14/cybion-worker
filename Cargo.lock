@@ -189,10 +189,11 @@ dependencies = [
 
 [[package]]
 name = "cybion-worker"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "flate2",
  "fs2",
  "futures-util",
