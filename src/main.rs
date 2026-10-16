@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -23,6 +23,9 @@ mod self_update;
 mod setup;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+// Liveness bounds for the Controller event stream; the body itself stays unbounded.
+const EVENT_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+const EVENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_TOOL_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_VIEW_IMAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -293,8 +296,15 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
     });
     let mut failures = 0;
     let outcome = loop {
-        match event_session_ready(&stream_client, &config, Some(config_path), delivery.clone())
-            .await
+        match event_session_ready(
+            &stream_client,
+            &config,
+            Some(config_path),
+            delivery.clone(),
+            EVENT_HEADERS_TIMEOUT,
+            EVENT_HEARTBEAT_TIMEOUT,
+        )
+        .await
         {
             Ok(Some(upgrade)) => {
                 delivery.wait_idle().await;
@@ -407,6 +417,8 @@ async fn event_session(client: &Client, config: &WorkerConfig) -> Result<()> {
         config,
         None,
         Arc::new(delivery::DeliveryState::new()),
+        EVENT_HEADERS_TIMEOUT,
+        EVENT_HEARTBEAT_TIMEOUT,
     )
     .await
     .map(|_| ())
@@ -417,21 +429,28 @@ async fn event_session_ready(
     config: &WorkerConfig,
     ready: Option<&Path>,
     delivery: Arc<delivery::DeliveryState>,
+    headers_timeout: Duration,
+    heartbeat_timeout: Duration,
 ) -> Result<Option<self_update::Upgrade>> {
-    let response = client
-        .get(format!("{}/events", worker_url(config)))
-        .header(delivery::BOOT_HEADER, &delivery.boot_id)
-        .header("x-cybion-worker-version", env!("CARGO_PKG_VERSION"))
-        .header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", config.access_token),
-        )
-        .send()
-        .await?
-        .error_for_status()?;
+    let response = tokio::time::timeout(
+        headers_timeout,
+        client
+            .get(format!("{}/events", worker_url(config)))
+            .header(delivery::BOOT_HEADER, &delivery.boot_id)
+            .header("x-cybion-worker-version", env!("CARGO_PKG_VERSION"))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", config.access_token),
+            )
+            .send(),
+    )
+    .await
+    .context("Worker event stream headers timeout")??
+    .error_for_status()?;
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     let mut ready = ready;
+    let mut last_event = Instant::now();
     while let Some(chunk) = tokio::time::timeout(Duration::from_secs(45), stream.next())
         .await
         .context("Worker event stream idle timeout")?
@@ -444,6 +463,11 @@ async fn event_session_ready(
             let event =
                 String::from_utf8(buffer[..separator].to_vec()).context("invalid event UTF-8")?;
             buffer.drain(..separator + width);
+            // Application events carry an `event:` line; keep-alive comments must not
+            // refresh this clock, or a stalled generator could drip forever behind them.
+            if event.lines().any(|line| line.starts_with("event:")) {
+                last_event = Instant::now();
+            }
             if let Some(upgrade) = self_update::parse_event(&event)? {
                 ensure!(
                     upgrade.boot_id == delivery.boot_id,
@@ -474,6 +498,10 @@ async fn event_session_ready(
                 delivery.cancel(&cancelled);
             }
         }
+        ensure!(
+            last_event.elapsed() < heartbeat_timeout,
+            "Worker event stream heartbeat timeout"
+        );
     }
     Ok(None)
 }

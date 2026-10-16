@@ -110,6 +110,9 @@ stops replaying calls this process already acknowledged. Receipt posts are
 in-flight work, so remote upgrades wait for them before replacing the executable.
 There is no task database, journal or disk outbox. Restarting Worker may lose
 results; the Controller must not replay old-process commands in the new process.
+The event stream is bounded by liveness checks: the Worker reconnects after 60
+seconds without response headers, 60 seconds without an application event, or
+45 seconds without a single byte; keep-alive comments do not count as events.
 
 From 0.2.0 onward, the owning user can request the Controller's recommended
 Worker release from the device page. The Controller pauses new task delivery
