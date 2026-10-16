@@ -1,10 +1,13 @@
 use super::*;
 use axum::{
     Json, Router,
+    body::{Body, Bytes},
     extract::Path as AxumPath,
     http::{HeaderMap, StatusCode},
+    response::Response,
     routing::{get, post},
 };
+use futures_util::stream;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 
 fn event(id: &str, command: &str) -> String {
@@ -264,9 +267,16 @@ async fn reconnect_and_lost_upload_confirmation_do_not_execute_twice() {
     });
     let delivery = Arc::new(delivery::DeliveryState::new());
     let client = Client::new();
-    event_session_ready(&client, &config, None, delivery.clone())
-        .await
-        .unwrap();
+    event_session_ready(
+        &client,
+        &config,
+        None,
+        delivery.clone(),
+        EVENT_HEADERS_TIMEOUT,
+        EVENT_HEARTBEAT_TIMEOUT,
+    )
+    .await
+    .unwrap();
     let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .unwrap()
@@ -278,9 +288,16 @@ async fn reconnect_and_lost_upload_confirmation_do_not_execute_twice() {
     assert_eq!(first, second);
     assert_eq!(first.0, delivery.boot_id);
     delivery.wait_idle().await;
-    event_session_ready(&client, &config, None, delivery.clone())
-        .await
-        .unwrap();
+    event_session_ready(
+        &client,
+        &config,
+        None,
+        delivery.clone(),
+        EVENT_HEADERS_TIMEOUT,
+        EVENT_HEARTBEAT_TIMEOUT,
+    )
+    .await
+    .unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
@@ -365,5 +382,125 @@ async fn cancel_event_aborts_a_running_call_before_its_timeout() {
     );
     assert!(started.elapsed() < Duration::from_secs(5));
     session.await.unwrap().unwrap();
+    server.abort();
+}
+
+async fn event_server(app: Router) -> (WorkerConfig, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = WorkerConfig {
+        controller_url: format!("http://{}", listener.local_addr().unwrap()),
+        user_id: "user".to_owned(),
+        machine_id: "worker".to_owned(),
+        access_token: "test".to_owned(),
+    };
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (config, server)
+}
+
+#[tokio::test]
+async fn stalled_response_headers_time_out_and_reconnect() {
+    let app = Router::new().route(
+        "/worker/v1/users/user/workers/worker/events",
+        get(|| async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            StatusCode::OK
+        }),
+    );
+    let (config, server) = event_server(app).await;
+    let started = std::time::Instant::now();
+    let error = event_session_ready(
+        &Client::new(),
+        &config,
+        None,
+        Arc::new(delivery::DeliveryState::new()),
+        Duration::from_millis(500),
+        Duration::from_secs(30),
+    )
+    .await
+    .err()
+    .expect("session must not survive stalled response headers");
+    assert!(error.to_string().contains("headers timeout"), "{error:#}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    server.abort();
+}
+
+#[tokio::test]
+async fn keep_alive_comments_alone_do_not_keep_the_stream_alive() {
+    let app = Router::new().route(
+        "/worker/v1/users/user/workers/worker/events",
+        get(|| async {
+            let comments = stream::unfold((), |_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b":\n\n")),
+                    (),
+                ))
+            });
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(comments))
+                .unwrap()
+        }),
+    );
+    let (config, server) = event_server(app).await;
+    let started = std::time::Instant::now();
+    let error = event_session_ready(
+        &Client::new(),
+        &config,
+        None,
+        Arc::new(delivery::DeliveryState::new()),
+        Duration::from_secs(5),
+        Duration::from_millis(500),
+    )
+    .await
+    .err()
+    .expect("session must not survive a comment-only stream");
+    assert!(error.to_string().contains("heartbeat timeout"), "{error:#}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    server.abort();
+}
+
+#[tokio::test]
+async fn keep_alive_comments_between_heartbeats_keep_the_stream_alive() {
+    let app = Router::new().route(
+        "/worker/v1/users/user/workers/worker/events",
+        get(|| async {
+            let frames = stream::unfold(0u8, |n| async move {
+                if n >= 8 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let chunk = if n % 2 == 0 {
+                    Bytes::from_static(b":\n\n")
+                } else {
+                    Bytes::from_static(b"event: heartbeat\ndata: {}\n\n")
+                };
+                Some((Ok::<_, std::convert::Infallible>(chunk), n + 1))
+            });
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(frames))
+                .unwrap()
+        }),
+    );
+    let (config, server) = event_server(app).await;
+    let session = event_session_ready(
+        &Client::new(),
+        &config,
+        None,
+        Arc::new(delivery::DeliveryState::new()),
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+    )
+    .await;
+    let session = match session {
+        Ok(session) => session,
+        Err(error) => panic!("{error:#}"),
+    };
+    assert!(session.is_none(), "session returned an upgrade");
     server.abort();
 }
