@@ -230,6 +230,7 @@ pub fn rollback(installed: &Path) -> Result<()> {
 pub async fn report(
     client: &Client,
     config: &WorkerConfig,
+    selector: &Arc<candidates::Selector>,
     boot_id: &str,
     upgrade: &Upgrade,
     status: &str,
@@ -238,7 +239,8 @@ pub async fn report(
     delivery::post_until_confirmed(
         client,
         config,
-        &format!("{}/upgrade", worker_url(config)),
+        selector,
+        "/upgrade",
         boot_id,
         &json!({"id":upgrade.id,"status":status,"error":error}),
     )

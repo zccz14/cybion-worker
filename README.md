@@ -72,10 +72,35 @@ The web guide's advanced section retains manual pairing. Save `worker.toml` to
 
 ```toml
 controller_url = "https://cybion.ntnl.io"
+# Optional: entries the Worker may connect through. Pairing writes both.
+#controller_urls = ["https://cybion.ntnl.io", "https://cybion.ntnl.top"]
 user_id = "..."
 machine_id = "..."
 access_token = "..."
 ```
+
+## Controller entry selection
+
+The Controller answers on more than one entry domain: `.io` is the globally
+distributed edge, `.top` reaches the same Controller through the mainland one.
+Which is better depends on the network the device is on, so the Worker measures
+instead of assuming:
+
+- At startup it probes every configured entry through the public `/health`
+  endpoint (three samples each, concurrently) and connects through the one that
+  answers best; a dead entry is skipped rather than retried.
+- It switches entry after three consecutive failed reconnects, and re-checks
+  every 30 minutes while connected. A re-check only moves the Worker when the
+  entry in use stops answering or is at least 20% slower, and never within a
+  minute of the previous switch, so a jittery network cannot make it flap.
+- A switch closes the task channel so it reconnects through the new entry.
+  Heartbeats, receipts and results resolve the entry per attempt, so an upload
+  in flight follows the switch instead of failing.
+- `controller_urls` is optional and order is the tie-break. With a single entry
+  the Worker behaves exactly as before, and a config written by an older
+  version keeps working unchanged.
+- `status` lists the configured entries; `doctor` probes each of them and
+  reports the one in use.
 
 Auto-setup uses atomic, no-clobber writes with owner-only permissions on Unix;
 Windows uses the current user's directory ACL. A malformed existing config is

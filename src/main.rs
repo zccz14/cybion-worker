@@ -17,6 +17,7 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 
+mod candidates;
 mod delivery;
 mod process;
 mod self_update;
@@ -33,10 +34,18 @@ const CDP_BASE: &str = "http://127.0.0.1:9222";
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CDP_RESTART_TIMEOUT: Duration = Duration::from_secs(15);
+// Switch entries after this many consecutive failed reconnects, and re-check
+// which entry is best this often while the task channel is healthy.
+const FAILURES_BEFORE_SWITCH: u32 = 3;
+const REPROBE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct WorkerConfig {
     controller_url: String,
+    /// Ordered entries this Worker may connect through. Absent from files
+    /// written by versions that only knew a single `controller_url`.
+    #[serde(default)]
+    controller_urls: Vec<String>,
     user_id: String,
     machine_id: String,
     access_token: String,
@@ -203,6 +212,8 @@ fn load_config(path: &Path) -> Result<WorkerConfig> {
         !config.access_token.trim().is_empty(),
         "access_token is required"
     );
+    // Every entry the Worker may use has to be valid, not just the primary.
+    candidates::resolve_candidates(controller_url, &config.controller_urls)?;
     Ok(WorkerConfig {
         controller_url: controller_url.to_owned(),
         ..config
@@ -280,18 +291,40 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
         .user_agent(format!("cybion-worker/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
     let delivery = Arc::new(delivery::DeliveryState::new());
+    let selector = candidates::Selector::new(candidates::resolve_candidates(
+        &config.controller_url,
+        &config.controller_urls,
+    )?)?;
+    // Connect through whichever entry actually answers, so a blocked or slower
+    // entry never becomes the one this device is stuck with.
+    candidates::choose(&client, &selector).await;
     let reporting_client = client.clone();
     let reporting_config = config.clone();
+    let reporting_selector = selector.clone();
     let reporting_boot = delivery.boot_id.clone();
     let reporting = tokio::spawn(async move {
         loop {
-            if let Err(error) =
-                report_liveness_for_boot(&reporting_client, &reporting_config, &reporting_boot)
-                    .await
+            if let Err(error) = report_liveness_for_boot(
+                &reporting_client,
+                &reporting_config,
+                &reporting_selector,
+                &reporting_boot,
+            )
+            .await
             {
                 tracing::warn!(%error, "Worker liveness report failed");
             }
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        }
+    });
+    // Networks change under a long-lived process, so re-measure periodically
+    // instead of trusting the entry that won at startup.
+    let reprobe_client = client.clone();
+    let reprobe_selector = selector.clone();
+    let reprobe = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(REPROBE_INTERVAL).await;
+            candidates::rebalance(&reprobe_client, &reprobe_selector).await;
         }
     });
     let mut failures = 0;
@@ -299,6 +332,7 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
         match event_session_ready(
             &stream_client,
             &config,
+            &selector,
             Some(config_path),
             delivery.clone(),
             EVENT_HEADERS_TIMEOUT,
@@ -312,6 +346,7 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
                     self_update::report(
                         &client,
                         &config,
+                        &selector,
                         &delivery.boot_id,
                         &upgrade,
                         "installing",
@@ -319,7 +354,7 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
                     )
                     .await?;
                     let installed =
-                        self_update::install(&client, &config.controller_url, &upgrade.version)
+                        self_update::install(&client, selector.current().base(), &upgrade.version)
                             .await?;
                     Ok::<_, anyhow::Error>(installed)
                 }
@@ -331,6 +366,7 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
                         if let Err(report_error) = self_update::report(
                             &client,
                             &config,
+                            &selector,
                             &delivery.boot_id,
                             &upgrade,
                             "failed",
@@ -353,24 +389,37 @@ async fn run(config: WorkerConfig, config_path: &Path) -> Result<PathBuf> {
                 }
                 tracing::warn!(%error, "Worker event stream ended; reconnecting");
                 failures += 1;
+                if failures % FAILURES_BEFORE_SWITCH == 0 && selector.len() > 1 {
+                    let next = selector.advance();
+                    tracing::warn!(
+                        entry = next.base(),
+                        "Worker could not reconnect; failing over to the next controller entry"
+                    );
+                }
             }
         }
         tokio::time::sleep(delivery::retry_delay(failures)).await;
     };
     reporting.abort();
+    reprobe.abort();
     outcome
 }
 
-async fn report_liveness(client: &Client, config: &WorkerConfig) -> Result<()> {
-    report_liveness_for_boot(client, config, "").await
+async fn report_liveness(
+    client: &Client,
+    config: &WorkerConfig,
+    selector: &Arc<candidates::Selector>,
+) -> Result<()> {
+    report_liveness_for_boot(client, config, selector, "").await
 }
 
 async fn report_liveness_for_boot(
     client: &Client,
     config: &WorkerConfig,
+    selector: &Arc<candidates::Selector>,
     boot_id: &str,
 ) -> Result<()> {
-    let base = worker_url(config);
+    let base = worker_url(selector.current().base(), config);
     let hostname = System::host_name().unwrap_or_else(|| "cybion-worker".to_owned());
     request(
         client,
@@ -410,11 +459,22 @@ fn resources() -> Value {
     })
 }
 
+/// A selector over the configured entries, for tests that drive one session.
+#[cfg(test)]
+fn test_selector(config: &WorkerConfig) -> Arc<candidates::Selector> {
+    candidates::Selector::new(
+        candidates::resolve_candidates(&config.controller_url, &config.controller_urls)
+            .expect("test entries"),
+    )
+    .expect("test selector")
+}
+
 #[cfg(test)]
 async fn event_session(client: &Client, config: &WorkerConfig) -> Result<()> {
     event_session_ready(
         client,
         config,
+        &test_selector(config),
         None,
         Arc::new(delivery::DeliveryState::new()),
         EVENT_HEADERS_TIMEOUT,
@@ -427,15 +487,20 @@ async fn event_session(client: &Client, config: &WorkerConfig) -> Result<()> {
 async fn event_session_ready(
     client: &Client,
     config: &WorkerConfig,
+    selector: &Arc<candidates::Selector>,
     ready: Option<&Path>,
     delivery: Arc<delivery::DeliveryState>,
     headers_timeout: Duration,
     heartbeat_timeout: Duration,
 ) -> Result<Option<self_update::Upgrade>> {
+    // A session keeps the entry it was opened through; a switch closes it and
+    // the caller reconnects through the new entry.
+    let base = worker_url(selector.current().base(), config);
+    let mut switch = selector.subscribe();
     let response = tokio::time::timeout(
         headers_timeout,
         client
-            .get(format!("{}/events", worker_url(config)))
+            .get(format!("{base}/events"))
             .header(delivery::BOOT_HEADER, &delivery.boot_id)
             .header("x-cybion-worker-version", env!("CARGO_PKG_VERSION"))
             .header(
@@ -451,10 +516,25 @@ async fn event_session_ready(
     let mut buffer = Vec::new();
     let mut ready = ready;
     let mut last_event = Instant::now();
-    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(45), stream.next())
-        .await
-        .context("Worker event stream idle timeout")?
-    {
+    loop {
+        let chunk = tokio::select! {
+            // A switch must take effect without waiting for the next chunk.
+            switched = switch.changed() => {
+                if switched.is_err() {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                tracing::info!(
+                    entry = selector.current().base(),
+                    "Controller entry switched; reopening the task channel"
+                );
+                return Ok(None);
+            }
+            chunk = tokio::time::timeout(Duration::from_secs(45), stream.next()) => {
+                chunk.context("Worker event stream idle timeout")?
+            }
+        };
+        let Some(chunk) = chunk else { return Ok(None) };
         buffer.extend_from_slice(&chunk?);
         while let Some((separator, width)) = delivery::frame_end(&buffer) {
             if let Some(path) = ready.take() {
@@ -476,18 +556,26 @@ async fn event_session_ready(
                 return Ok(Some(upgrade));
             }
             if let Some(call) = parse_sse_call(&event)? {
-                spawn_receipt(client, config, &delivery, &call);
+                spawn_receipt(client, config, selector, &delivery, &call);
                 if !delivery.admit(&call)? {
                     continue;
                 }
                 let cancel = delivery.watch_cancel(&call.id);
                 let client = client.clone();
                 let config = config.clone();
+                let selector = selector.clone();
                 let delivery = delivery.clone();
                 tokio::spawn(async move {
                     let call_id = call.id.clone();
-                    if let Err(error) =
-                        execute_and_submit(&client, &config, call, cancel, &delivery.boot_id).await
+                    if let Err(error) = execute_and_submit(
+                        &client,
+                        &config,
+                        &selector,
+                        call,
+                        cancel,
+                        &delivery.boot_id,
+                    )
+                    .await
                     {
                         tracing::warn!(%call_id, %error, "Worker result submission permanently rejected");
                     }
@@ -503,7 +591,6 @@ async fn event_session_ready(
             "Worker event stream heartbeat timeout"
         );
     }
-    Ok(None)
 }
 
 fn call_category(name: &str) -> &'static str {
@@ -520,23 +607,27 @@ fn call_category(name: &str) -> &'static str {
 fn spawn_receipt(
     client: &Client,
     config: &WorkerConfig,
+    selector: &Arc<candidates::Selector>,
     delivery: &Arc<delivery::DeliveryState>,
     call: &ToolCall,
 ) {
-    let url = format!(
-        "{}/{}/{}/received",
-        worker_url(config),
-        call_category(&call.name),
-        call.id
-    );
+    let path = format!("/{}/{}/received", call_category(&call.name), call.id);
     let call_id = call.id.clone();
     let client = client.clone();
     let config = config.clone();
+    let selector = selector.clone();
     let delivery = delivery.clone();
     delivery.begin();
     tokio::spawn(async move {
-        match delivery::post_until_confirmed(&client, &config, &url, &delivery.boot_id, &json!({}))
-            .await
+        match delivery::post_until_confirmed(
+            &client,
+            &config,
+            &selector,
+            &path,
+            &delivery.boot_id,
+            &json!({}),
+        )
+        .await
         {
             Ok(()) => tracing::info!(call_id = %call_id, "Worker receipt submitted"),
             Err(error) => {
@@ -587,6 +678,7 @@ fn parse_sse_cancel(event: &str) -> Result<Option<String>> {
 async fn execute_and_submit(
     client: &Client,
     config: &WorkerConfig,
+    selector: &Arc<candidates::Selector>,
     call: ToolCall,
     mut cancel: watch::Receiver<bool>,
     boot_id: &str,
@@ -602,16 +694,12 @@ async fn execute_and_submit(
         Err(error) => (true, json!({"error":error.to_string()})),
     };
     tracing::info!(call_id = %call.id, thread_id = %call.thread_id, tool = %call.name, failed, "Worker tool call finished");
-    let url = format!(
-        "{}/{}/{}/result",
-        worker_url(config),
-        call_category(&call.name),
-        call.id
-    );
+    let path = format!("/{}/{}/result", call_category(&call.name), call.id);
     delivery::post_until_confirmed(
         client,
         config,
-        &url,
+        selector,
+        &path,
         boot_id,
         &json!({"result":result,"failed":failed}),
     )
@@ -636,10 +724,10 @@ async fn request(
     Ok(())
 }
 
-fn worker_url(config: &WorkerConfig) -> String {
+fn worker_url(base: &str, config: &WorkerConfig) -> String {
     format!(
-        "{}/worker/v1/users/{}/workers/{}",
-        config.controller_url, config.user_id, config.machine_id
+        "{base}/worker/v1/users/{}/workers/{}",
+        config.user_id, config.machine_id
     )
 }
 
@@ -1222,12 +1310,13 @@ access_token = "secret""#,
     fn supports_the_cloud_worker_protocol_paths() {
         let config = WorkerConfig {
             controller_url: "https://cybion.ntnl.io".to_owned(),
+            controller_urls: Vec::new(),
             user_id: "auth-user".to_owned(),
             machine_id: "worker".to_owned(),
             access_token: "token".to_owned(),
         };
         assert_eq!(
-            worker_url(&config),
+            worker_url(&config.controller_url, &config),
             "https://cybion.ntnl.io/worker/v1/users/auth-user/workers/worker"
         );
     }
