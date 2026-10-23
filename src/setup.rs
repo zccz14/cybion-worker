@@ -8,8 +8,6 @@ use std::{
 };
 use uuid::Uuid;
 
-const CONTROLLER: &str = "https://cybion.ntnl.io";
-
 #[derive(Serialize, Deserialize)]
 struct Pending {
     id: String,
@@ -73,10 +71,46 @@ pub async fn load_or_pair(path: &Path) -> Result<WorkerConfig> {
     if path.try_exists()? {
         return load_config(path);
     }
-    pair(path, CONTROLLER).await
+    let entries = candidates::default_candidates()?;
+    let mut last_error = None;
+    for entry in &entries {
+        match pair(path, entry.base(), &entries).await {
+            Ok(config) => return Ok(config),
+            // Only an unreachable entry moves on: an entry that answers and
+            // refuses is the real answer and must not be papered over.
+            Err(error) if unreachable(&error) => {
+                eprintln!(
+                    "Could not reach {} ({}); trying the next entry…",
+                    entry.base(),
+                    describe(&error)
+                );
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no controller entry could be reached")))
 }
 
-async fn pair(path: &Path, controller: &str) -> Result<WorkerConfig> {
+/// A network-level failure, as opposed to an answer we should believe.
+fn unreachable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|error| error.is_connect() || error.is_timeout() || error.is_request())
+}
+
+fn describe(error: &anyhow::Error) -> String {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
+async fn pair(
+    path: &Path,
+    controller: &str,
+    entries: &[candidates::Candidate],
+) -> Result<WorkerConfig> {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(15))
@@ -173,6 +207,11 @@ async fn pair(path: &Path, controller: &str) -> Result<WorkerConfig> {
             "approved" => {
                 let config = WorkerConfig {
                     controller_url: controller.into(),
+                    // Remember every entry so the next start can choose again.
+                    controller_urls: entries
+                        .iter()
+                        .map(|entry| entry.base().to_owned())
+                        .collect(),
                     user_id: reply.user_id.context("approval has no owner")?,
                     machine_id: reply.machine_id,
                     access_token: pending.access_token,
@@ -265,11 +304,17 @@ pub fn mark_ready(config: &Path) -> Result<()> {
 
 pub async fn status(path: &Path) -> Result<()> {
     let config = load_config(path)?;
+    let entries = candidates::resolve_candidates(&config.controller_url, &config.controller_urls)?;
     println!(
-        "Config: {}\nController: {}\nWorker: {}",
+        "Config: {}\nController: {}\nWorker: {}\nController entries: {}",
         path.display(),
         config.controller_url,
-        config.machine_id
+        config.machine_id,
+        entries
+            .iter()
+            .map(|entry| entry.base())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let lock = lock(path);
     if lock.is_ok() {
@@ -299,10 +344,18 @@ pub async fn status(path: &Path) -> Result<()> {
 pub async fn doctor(path: &Path) -> Result<()> {
     let config = load_config(path)?;
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let selector = candidates::Selector::new(candidates::resolve_candidates(
+        &config.controller_url,
+        &config.controller_urls,
+    )?)?;
+    // Probing first shows which entries this network can actually use, then the
+    // authenticated heartbeat runs against the best of them.
+    candidates::choose(&client, &selector).await;
+    let base = selector.current().base().to_owned();
     // This only authenticates a heartbeat; the web check validates the real SSE round trip.
-    report_liveness(&client,&config).await.context("Controller authentication/network check failed. Check credentials, HTTPS access and device revocation.")?;
+    report_liveness(&client,&config,&selector).await.with_context(|| format!("Controller authentication/network check failed for {base}. Check credentials, HTTPS access and device revocation."))?;
     println!(
-        "Controller authentication: OK\n{}\nRun the web connection check to test the task channel. Browser and desktop permissions are NOT tested by doctor.",
+        "Controller entry in use: {base}\nController authentication: OK\n{}\nRun the web connection check to test the task channel. Browser and desktop permissions are NOT tested by doctor.",
         serde_json::to_string_pretty(&diagnostics().await)?
     );
     Ok(())
@@ -402,7 +455,8 @@ mod pairing_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://localhost:{}", listener.local_addr().unwrap().port());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let config = pair(&path, &url).await.unwrap();
+        let entries = candidates::resolve_candidates(&url, &[]).unwrap();
+        let config = pair(&path, &url, &entries).await.unwrap();
         assert_eq!(config.access_token, access_token);
         assert_eq!(config.user_id, "owner");
         assert!(!path.with_extension("pairing.json").exists());
@@ -431,7 +485,8 @@ mod pairing_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://localhost:{}", listener.local_addr().unwrap().port());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        assert!(pair(&path, &url).await.is_err());
+        let entries = candidates::resolve_candidates(&url, &[]).unwrap();
+        assert!(pair(&path, &url, &entries).await.is_err());
         assert!(!path.exists());
         assert!(!path.with_extension("pairing.json").exists());
         server.abort();

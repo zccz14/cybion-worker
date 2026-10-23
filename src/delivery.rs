@@ -126,14 +126,18 @@ pub fn retryable(error: &anyhow::Error) -> bool {
 pub async fn post_until_confirmed(
     client: &Client,
     config: &WorkerConfig,
-    url: &str,
+    selector: &Arc<candidates::Selector>,
+    path: &str,
     boot_id: &str,
     payload: &Value,
 ) -> Result<()> {
     let mut failures = 0;
     loop {
+        // Resolved per attempt, so a retry follows an entry switch instead of
+        // pinning the message to the entry that just failed.
+        let url = format!("{}{}", worker_url(selector.current().base(), config), path);
         let response = client
-            .post(url)
+            .post(&url)
             .bearer_auth(&config.access_token)
             .header(BOOT_HEADER, boot_id)
             .timeout(Duration::from_secs(30))

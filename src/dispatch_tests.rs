@@ -84,6 +84,7 @@ async fn controller(
         user_id: "user".to_owned(),
         machine_id: "worker".to_owned(),
         access_token: "test".to_owned(),
+        controller_urls: Vec::new(),
     };
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -261,6 +262,7 @@ async fn reconnect_and_lost_upload_confirmation_do_not_execute_twice() {
         user_id: "user".into(),
         machine_id: "worker".into(),
         access_token: "test".into(),
+        controller_urls: Vec::new(),
     };
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -270,6 +272,7 @@ async fn reconnect_and_lost_upload_confirmation_do_not_execute_twice() {
     event_session_ready(
         &client,
         &config,
+        &test_selector(&config),
         None,
         delivery.clone(),
         EVENT_HEADERS_TIMEOUT,
@@ -291,6 +294,7 @@ async fn reconnect_and_lost_upload_confirmation_do_not_execute_twice() {
     event_session_ready(
         &client,
         &config,
+        &test_selector(&config),
         None,
         delivery.clone(),
         EVENT_HEADERS_TIMEOUT,
@@ -316,7 +320,8 @@ async fn permanent_upload_rejection_is_not_retried() {
     let error = delivery::post_until_confirmed(
         &Client::new(),
         &config,
-        &format!("{}/missing", config.controller_url),
+        &test_selector(&config),
+        "/missing",
         "boot",
         &json!({}),
     )
@@ -392,6 +397,7 @@ async fn event_server(app: Router) -> (WorkerConfig, JoinHandle<()>) {
         user_id: "user".to_owned(),
         machine_id: "worker".to_owned(),
         access_token: "test".to_owned(),
+        controller_urls: Vec::new(),
     };
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -413,6 +419,7 @@ async fn stalled_response_headers_time_out_and_reconnect() {
     let error = event_session_ready(
         &Client::new(),
         &config,
+        &test_selector(&config),
         None,
         Arc::new(delivery::DeliveryState::new()),
         Duration::from_millis(500),
@@ -450,6 +457,7 @@ async fn keep_alive_comments_alone_do_not_keep_the_stream_alive() {
     let error = event_session_ready(
         &Client::new(),
         &config,
+        &test_selector(&config),
         None,
         Arc::new(delivery::DeliveryState::new()),
         Duration::from_secs(5),
@@ -491,6 +499,7 @@ async fn keep_alive_comments_between_heartbeats_keep_the_stream_alive() {
     let session = event_session_ready(
         &Client::new(),
         &config,
+        &test_selector(&config),
         None,
         Arc::new(delivery::DeliveryState::new()),
         Duration::from_secs(5),
