@@ -18,10 +18,32 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 pub const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-/// Keeps a child's console invisible; a no-op off Windows.
+/// Hides the console of a child that is spawned directly, without a
+/// `CommandWrap`. Wrapped children need the wrapper instead: `JobObject`
+/// re-applies creation flags from `CreationFlags` and would otherwise drop
+/// this one on the floor.
 #[cfg(windows)]
 pub fn hide_console(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// Wraps a child the same way every tool call does: kill-on-drop, its own
+/// process group or job object, and — on Windows — a windowless console.
+fn wrapped(command: Command) -> CommandWrap {
+    let mut command = CommandWrap::from(command);
+    command.wrap(KillOnDrop);
+    #[cfg(unix)]
+    command.wrap(process_wrap::tokio::ProcessGroup::leader());
+    #[cfg(windows)]
+    {
+        // Order does not matter: each wrapper consults the other. `JobObject`
+        // temporarily adds CREATE_SUSPENDED and resumes after assignment.
+        command.wrap(process_wrap::tokio::JobObject);
+        command.wrap(process_wrap::tokio::CreationFlags(
+            windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW),
+        ));
+    }
+    command
 }
 
 pub async fn output(
@@ -37,14 +59,7 @@ pub async fn output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    hide_console(&mut command);
-    let mut command = CommandWrap::from(command);
-    command.wrap(KillOnDrop);
-    #[cfg(unix)]
-    command.wrap(process_wrap::tokio::ProcessGroup::leader());
-    #[cfg(windows)]
-    command.wrap(process_wrap::tokio::JobObject);
+    let mut command = wrapped(command);
     let mut child = command
         .spawn()
         .with_context(|| format!("could not start {label}"))?;
@@ -92,31 +107,67 @@ mod tests {
     use sysinfo::{Pid, ProcessStatus, System};
 
     // The Worker runs detached, so Windows hands every child its own console
-    // window unless the child is asked for a windowless console. A regression
-    // here is the black window users see flashing once per call.
+    // window unless the child is asked for a windowless console. The request
+    // has to travel through process-wrap's `CreationFlags`: `JobObject`
+    // re-applies creation flags and silently drops anything set directly on
+    // the command. That regression is the black window users see on every call.
+    #[cfg(windows)]
+    #[test]
+    fn windows_tool_children_ask_for_a_windowless_console() {
+        let command = wrapped(Command::new("cmd"));
+        let flags = command
+            .get_wrap::<process_wrap::tokio::CreationFlags>()
+            .expect("tool children must register CreationFlags next to JobObject");
+        assert_ne!(
+            flags.0.0 & CREATE_NO_WINDOW,
+            0,
+            "tool children must keep CREATE_NO_WINDOW through process-wrap"
+        );
+    }
+
+    // A console window is exactly what users see flashing once per call. The
+    // control child is spawned without the windowless flag: it proves this
+    // session can see a console window at all, so the subject assertion means
+    // something instead of passing in a session that reports none either way.
+    #[cfg(windows)]
+    const CONSOLE_PROBE: &str = "Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow();' -Name Native -Namespace Cybion; [Console]::Out.Write([Cybion.Native]::GetConsoleWindow())";
+
+    #[cfg(windows)]
+    async fn probe_console_window(tool_path: bool) -> i64 {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", CONSOLE_PROBE]);
+        let out = if tool_path {
+            let (_cancel, mut receiver) = watch::channel(false);
+            output(
+                command,
+                Duration::from_secs(60),
+                "console probe",
+                &mut receiver,
+            )
+            .await
+            .unwrap()
+        } else {
+            command.kill_on_drop(true).output().await.unwrap()
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("console probe did not print a window handle")
+    }
+
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_child_console_has_no_window() {
-        let mut command = Command::new("powershell");
-        command.args([
-            "-NoProfile",
-            "-Command",
-            "Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow();' -Name Native -Namespace Cybion; [Cybion.Native]::GetConsoleWindow()",
-        ]);
-        let (_cancel, mut receiver) = watch::channel(false);
-        let output = output(
-            command,
-            Duration::from_secs(60),
-            "console probe",
-            &mut receiver,
-        )
-        .await
-        .unwrap();
-        assert!(output.status.success(), "console probe failed: {output:?}");
+    async fn windows_tool_children_own_no_console_window() {
+        if probe_console_window(false).await == 0 {
+            eprintln!(
+                "skipped: this session allocates no console window even without the flag, so the measurement cannot tell the two apart"
+            );
+            return;
+        }
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "0",
-            "the child was given a console window"
+            probe_console_window(true).await,
+            0,
+            "a tool child owns a console window: that is the black window users see flashing"
         );
     }
 

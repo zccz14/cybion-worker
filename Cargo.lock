@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "cybion-worker"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -214,6 +214,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows",
 ]
 
 [[package]]
