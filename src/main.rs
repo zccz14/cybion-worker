@@ -249,7 +249,7 @@ async fn launch_background_at(executable: PathBuf, config: PathBuf) -> Result<()
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0000_0008 | 0x0800_0000);
+        command.creation_flags(process::DETACHED_PROCESS | process::CREATE_NO_WINDOW);
     }
     let mut child = command
         .spawn()

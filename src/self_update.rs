@@ -192,14 +192,11 @@ pub async fn install(client: &Client, controller_url: &str, requested: &str) -> 
     }
     // Windows requires closing the staging writer before executing the image.
     let staged = staged.into_temp_path();
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        Command::new(&staged)
-            .arg("--help")
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await??;
+    let mut preflight = Command::new(&staged);
+    preflight.arg("--help").kill_on_drop(true);
+    #[cfg(windows)]
+    process::hide_console(&mut preflight);
+    let output = tokio::time::timeout(Duration::from_secs(10), preflight.output()).await??;
     ensure!(
         output.status.success()
             && String::from_utf8_lossy(&output.stdout).contains(&format!(
