@@ -7,6 +7,23 @@ use anyhow::{Context, Result, bail};
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use tokio::{io::AsyncReadExt, process::Command, sync::watch};
 
+/// Windows flags for `CreateProcess`. The Worker itself is started detached
+/// and owns no console, so a console-subsystem child would get a brand-new
+/// console window allocated — the black window that flashes on screen for
+/// every scheduled or interactive call. Ask for a windowless console instead.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Starts the Worker detached from any console it was launched from.
+#[cfg(windows)]
+pub const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+/// Keeps a child's console invisible; a no-op off Windows.
+#[cfg(windows)]
+pub fn hide_console(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
 pub async fn output(
     mut command: Command,
     timeout: Duration,
@@ -20,6 +37,8 @@ pub async fn output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(windows)]
+    hide_console(&mut command);
     let mut command = CommandWrap::from(command);
     command.wrap(KillOnDrop);
     #[cfg(unix)]
@@ -71,6 +90,35 @@ pub async fn output(
 mod tests {
     use super::*;
     use sysinfo::{Pid, ProcessStatus, System};
+
+    // The Worker runs detached, so Windows hands every child its own console
+    // window unless the child is asked for a windowless console. A regression
+    // here is the black window users see flashing once per call.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_child_console_has_no_window() {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-Command",
+            "Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow();' -Name Native -Namespace Cybion; [Cybion.Native]::GetConsoleWindow()",
+        ]);
+        let (_cancel, mut receiver) = watch::channel(false);
+        let output = output(
+            command,
+            Duration::from_secs(60),
+            "console probe",
+            &mut receiver,
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success(), "console probe failed: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "0",
+            "the child was given a console window"
+        );
+    }
 
     // This test executable also provides a portable, real three-generation process tree.
     #[test]
