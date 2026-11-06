@@ -125,6 +125,52 @@ mod tests {
         );
     }
 
+    // A console window is exactly what users see flashing once per call. The
+    // control child is spawned without the windowless flag: it proves this
+    // session can see a console window at all, so the subject assertion means
+    // something instead of passing in a session that reports none either way.
+    #[cfg(windows)]
+    const CONSOLE_PROBE: &str = "Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow();' -Name Native -Namespace Cybion; [Console]::Out.Write([Cybion.Native]::GetConsoleWindow())";
+
+    #[cfg(windows)]
+    async fn probe_console_window(tool_path: bool) -> i64 {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", CONSOLE_PROBE]);
+        let out = if tool_path {
+            let (_cancel, mut receiver) = watch::channel(false);
+            output(
+                command,
+                Duration::from_secs(60),
+                "console probe",
+                &mut receiver,
+            )
+            .await
+            .unwrap()
+        } else {
+            command.kill_on_drop(true).output().await.unwrap()
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("console probe did not print a window handle")
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_tool_children_own_no_console_window() {
+        if probe_console_window(false).await == 0 {
+            eprintln!(
+                "skipped: this session allocates no console window even without the flag, so the measurement cannot tell the two apart"
+            );
+            return;
+        }
+        assert_eq!(
+            probe_console_window(true).await,
+            0,
+            "a tool child owns a console window: that is the black window users see flashing"
+        );
+    }
+
     // This test executable also provides a portable, real three-generation process tree.
     #[test]
     #[ignore]
